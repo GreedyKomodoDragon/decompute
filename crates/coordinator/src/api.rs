@@ -15,7 +15,6 @@ use protocol::{
 };
 use std::{io, sync::Arc};
 use tracing::info;
-use uuid::Uuid;
 
 pub fn router(registry: Arc<Registry>) -> Router {
     Router::new()
@@ -55,19 +54,20 @@ async fn heartbeat(
 async fn list(State(registry): State<Arc<Registry>>) -> Json<Vec<crate::registry::WorkerRecord>> {
     Json(registry.list().await)
 }
-fn request(request: PublicGenerateRequest) -> GenerateRequest {
-    GenerateRequest {
-        request_id: request.request_id.unwrap_or_else(Uuid::new_v4),
-        model: request.model,
-        prompt: request.prompt,
-        max_tokens: request.max_tokens,
-    }
+
+fn request(
+    request: PublicGenerateRequest,
+) -> Result<GenerateRequest, protocol::RequestValidationError> {
+    request.into_generate_request()
 }
 async fn generate(
     State(registry): State<Arc<Registry>>,
     Json(public): Json<PublicGenerateRequest>,
 ) -> impl IntoResponse {
-    let request = request(public);
+    let request = match request(public) {
+        Ok(request) => request,
+        Err(err) => return error(StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
     let Some(worker) = registry.select_and_reserve(&request.model).await else {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -112,7 +112,10 @@ async fn stream_generate(
     State(registry): State<Arc<Registry>>,
     Json(public): Json<PublicGenerateRequest>,
 ) -> impl IntoResponse {
-    let request = request(public);
+    let request = match request(public) {
+        Ok(request) => request,
+        Err(err) => return error(StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
     let Some(worker) = registry.select_and_reserve(&request.model).await else {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,

@@ -23,12 +23,14 @@ candle-nn = "0.9"
 candle-transformers = "0.9"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
+minijinja = { version = "2", features = ["json"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sysinfo = "0.33"
 thiserror = "2"
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }
 tokio-stream = "0.1"
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }

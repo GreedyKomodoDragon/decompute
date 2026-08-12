@@ -1,9 +1,14 @@
-use crate::{GenerationConfig, GenerationResult, TokenCallback, tokenizer};
+use crate::{
+    GenerationConfig, GenerationResult, TokenCallback,
+    descriptor::ModelDescriptor,
+    prompt_template::TemplateBundle,
+    provider::{CausalModelBackend, ProviderRegistry},
+    tokenizer,
+};
 use anyhow::{Context, Result, bail};
 use candle_core::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::{generation::LogitsProcessor, models::qwen2};
-use protocol::{Acceleration, HardwareInfo, ModelFile, ModelManifest};
+use candle_transformers::generation::LogitsProcessor;
+use protocol::{Acceleration, ChatMessage, HardwareInfo, ModelFile, ModelManifest};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -15,7 +20,8 @@ use tokenizers::Tokenizer;
 
 pub struct LocalModel {
     tokenizer: Tokenizer,
-    model: qwen2::ModelForCausalLM,
+    templates: TemplateBundle,
+    backend: Box<dyn CausalModelBackend>,
     device: Device,
     end_tokens: Vec<u32>,
 }
@@ -26,45 +32,45 @@ impl LocalModel {
     }
 
     pub fn load_on_device(path: impl AsRef<Path>, device: Device) -> Result<Self> {
-        let path = path.as_ref();
-        let config_path = path.join("config.json");
-        let tokenizer_path = path.join("tokenizer.json");
-        let weights_path = path.join("model.safetensors");
-        for required in [&config_path, &tokenizer_path, &weights_path] {
-            if !required.exists() {
-                bail!("missing model file {}", required.display());
-            }
-        }
-        let config: qwen2::Config = serde_json::from_reader(fs::File::open(&config_path)?)
-            .context("parse Qwen config.json")?;
-        let tokenizer = tokenizer::load(&tokenizer_path)?;
-        let dtype = execution_dtype(&weights_path, &device)?;
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device) }
-            .context("memory-map model.safetensors")?;
-        let model = qwen2::ModelForCausalLM::new(&config, vb).context("load Qwen model")?;
-        let end_tokens = ["<|im_end|>", "<|endoftext|>"]
-            .iter()
+        let descriptor = ModelDescriptor::load(path)?;
+        let tokenizer = tokenizer::load(&descriptor.tokenizer_path)?;
+        let templates = TemplateBundle::load(&descriptor)?;
+        let dtype = execution_dtype(&descriptor.weight_paths[0], &device)?;
+        let backend = ProviderRegistry::builtin().load(&descriptor, &device, dtype)?;
+        let mut end_tokens = templates
+            .eos_token()
+            .into_iter()
+            .chain(["<|endoftext|>"])
             .filter_map(|token| tokenizer.token_to_id(token))
-            .collect();
+            .collect::<Vec<_>>();
+        end_tokens.sort_unstable();
+        end_tokens.dedup();
         Ok(Self {
             tokenizer,
-            model,
+            templates,
+            backend,
             device,
             end_tokens,
         })
     }
 
-    pub fn generate(&mut self, prompt: &str, config: GenerationConfig) -> Result<GenerationResult> {
-        self.generate_with_callback(prompt, config, &mut |_| Ok(()))
+    pub fn generate(
+        &mut self,
+        messages: &[ChatMessage],
+        template: Option<&str>,
+        config: GenerationConfig,
+    ) -> Result<GenerationResult> {
+        self.generate_with_callback(messages, template, config, &mut |_| Ok(()))
     }
 
     pub fn generate_with_callback(
         &mut self,
-        prompt: &str,
+        messages: &[ChatMessage],
+        template: Option<&str>,
         config: GenerationConfig,
         callback: &mut TokenCallback<'_>,
     ) -> Result<GenerationResult> {
-        let prompt = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n");
+        let prompt = self.templates.render(messages, template)?;
         let encoding = self
             .tokenizer
             .encode(prompt, false)
@@ -74,7 +80,7 @@ impl LocalModel {
             bail!("prompt tokenized to zero tokens");
         }
         let input_tokens = tokens.len();
-        self.model.clear_kv_cache();
+        self.backend.clear_kv_cache();
         let mut logits_processor = LogitsProcessor::new(299_792_458, config.temperature, None);
         let mut output = String::new();
         let result = (|| {
@@ -85,13 +91,8 @@ impl LocalModel {
                     .unsqueeze(0)
                     .context("add batch dimension")?;
                 let logits = self
-                    .model
-                    .forward(&input, tokens.len() - context_size)
-                    .context("Qwen forward pass")?
-                    .squeeze(0)
-                    .context("remove Qwen batch dimension")?
-                    .squeeze(0)
-                    .context("remove Qwen sequence dimension")?;
+                    .backend
+                    .next_token_logits(&input, tokens.len() - context_size)?;
                 let token = logits_processor
                     .sample(&logits)
                     .context("sample next token")?;
@@ -112,7 +113,7 @@ impl LocalModel {
                 output_tokens: tokens.len() - input_tokens,
             })
         })();
-        self.model.clear_kv_cache();
+        self.backend.clear_kv_cache();
         result
     }
 }
@@ -172,15 +173,29 @@ fn safetensors_dtype(path: &Path) -> Result<String> {
 }
 
 pub fn local_manifest(path: impl AsRef<Path>) -> Result<ModelManifest> {
-    let root = path.as_ref();
-    let names = ["config.json", "tokenizer.json", "model.safetensors"];
-    let files = names
+    let descriptor = ModelDescriptor::load(path)?;
+    let root = &descriptor.directory;
+    let mut paths = vec![
+        descriptor.config_path.clone(),
+        descriptor.tokenizer_path.clone(),
+        descriptor.tokenizer_config_path.clone(),
+    ];
+    paths.extend(descriptor.weight_paths.clone());
+    let standalone_template = root.join("chat_template.jinja");
+    if standalone_template.exists() {
+        paths.push(standalone_template);
+    }
+    let files = paths
         .iter()
         .map(|name| {
-            let path = root.join(name);
+            let path = name.clone();
             let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
             Ok(ModelFile {
-                path: (*name).to_owned(),
+                path: path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string(),
                 sha256: format!("{:x}", Sha256::digest(bytes)),
             })
         })
@@ -192,7 +207,7 @@ pub fn local_manifest(path: impl AsRef<Path>) -> Result<ModelManifest> {
     }
     Ok(ModelManifest {
         id: format!("sha256:{:x}", hasher.finalize()),
-        architecture: "qwen2".into(),
+        architecture: descriptor.model_type,
         revision: "local".into(),
         quantization: None,
         files,

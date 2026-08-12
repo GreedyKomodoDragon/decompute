@@ -12,8 +12,8 @@ The coordinator only understands HTTP and the shared protocol. Candle, tokenizat
 
 | Crate | Responsibility |
 | --- | --- |
-| `protocol` | Shared, serializable network types: model capabilities, worker registration and heartbeats, generation requests/responses, API errors, hardware data, and manifests. It has no HTTP or inference dependency. |
-| `inference` | Local model runtime. It loads the Qwen config, tokenizer, and safetensors weights; selects a compatible execution dtype for the device; generates tokens; calculates model manifests; and reports hardware basics. This is the only library crate that knows Candle. |
+| `protocol` | Shared, serializable network types: model capabilities, worker registration and heartbeats, chat/generation requests/responses, API errors, hardware data, and manifests. It has no HTTP or inference dependency. |
+| `inference` | Local model runtime. It loads the Qwen config, tokenizer, chat template, and safetensors weights; selects a compatible execution dtype for the device; generates tokens; calculates model manifests; and reports hardware basics. This is the only library crate that knows Candle. |
 | `inference-example` | Small executable for proving local inference before networking. It loads `./models/tiny-model` and prints generated text. |
 | `worker` | Process that owns a complete local model. Its Axum server exposes health, capabilities, generation, SSE streaming, and draining endpoints. A dedicated OS thread owns the model and receives jobs over a channel, so blocking inference never occupies Tokio worker threads. It registers with the coordinator and heartbeats every five seconds. |
 | `coordinator` | Inference-library-free Axum service. It stores worker records, expires stale heartbeats, selects the least-busy eligible worker with an exact model match, forwards requests with Reqwest, and proxies SSE streams. |
@@ -64,6 +64,54 @@ curl http://127.0.0.1:8000/v1/generate \
 ```
 
 The public endpoint creates a UUID if `request_id` is omitted and responds with the selected worker, text, and nested token usage. Inspect the registry with `curl http://127.0.0.1:8000/workers`.
+
+### Chat messages and model templates
+
+Requests accept exactly one of `prompt` or `messages`. `prompt` remains compatible with the original API and is internally converted into one `user` message:
+
+```json
+{"model":"tiny-model","prompt":"Why is the sky blue?","max_tokens":100}
+```
+
+For system instructions and chat history, pass structured messages:
+
+```bash
+curl http://127.0.0.1:8000/v1/generate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "tiny-model",
+    "messages": [
+      {"role": "system", "content": "Answer in one sentence."},
+      {"role": "user", "content": "Why is the sky blue?"}
+    ],
+    "max_tokens": 100
+  }'
+```
+
+At model load, the worker reads the Hugging Face `chat_template` from `tokenizer_config.json` and compiles it with MiniJinja. It renders the normalized messages with `add_generation_prompt: true`, then passes the rendered text to that model's `tokenizer.json`. This replaces the prior hard-coded Qwen prompt wrapper. The template renderer is independent of Candle model execution, so a later architecture adapter can reuse it for another supported model family.
+
+For safety, templates have no filesystem loader or host callbacks. This first version passes `tools: []`; tool calls and multimodal message content are intentionally unsupported.
+
+### Providers and named templates
+
+The worker detects the model family from `config.json`'s `model_type` and uses a matching inference provider. Qwen2 is the initial registered provider. Adding a family such as Llama or Mistral means implementing one provider module that loads its Candle model and returns rank-one next-token logits; tokenization, sampling, HTTP, scheduling, and SSE remain unchanged.
+
+Templates are independent from providers. A model directory can supply them in either Hugging Face format:
+
+- `chat_template.jinja` takes precedence as the `default` template.
+- Otherwise, `tokenizer_config.json`'s `chat_template` may be one string (`default`) or an object of named templates. Named templates can use MiniJinja `include` and `import` to share subtemplates.
+
+Choose a named template explicitly when the model provides one:
+
+```json
+{
+  "model": "tiny-model",
+  "template": "rag",
+  "messages": [{"role": "user", "content": "Summarize this context."}]
+}
+```
+
+If no `template` is supplied, the worker uses `default`. Unknown names return a clear error listing the templates packaged by that model.
 
 For streaming, use `curl -N` against `/v1/generate/stream` with the same JSON body. It proxies worker SSE frames and ends with `data: [DONE]`.
 

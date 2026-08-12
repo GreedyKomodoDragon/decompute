@@ -24,7 +24,9 @@ async fn main() -> Result<()> {
         .json(&PublicGenerateRequest {
             request_id: None,
             model: args.model,
-            prompt: args.prompt,
+            prompt: Some(args.prompt),
+            messages: None,
+            template: None,
             max_tokens: args.max_tokens,
         })
         .send()

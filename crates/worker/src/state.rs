@@ -62,14 +62,19 @@ impl WorkerRuntime {
                 while let Some(job) = receiver.blocking_recv() {
                     match job {
                         InferenceJob::Generate { request, response } => {
-                            let result = model
-                                .generate(
-                                    &request.prompt,
-                                    GenerationConfig {
-                                        max_tokens: request.max_tokens,
-                                        temperature: None,
-                                    },
-                                )
+                            let result = request
+                                .normalized_messages()
+                                .map_err(anyhow::Error::msg)
+                                .and_then(|messages| {
+                                    model.generate(
+                                        &messages,
+                                        request.template.as_deref(),
+                                        GenerationConfig {
+                                            max_tokens: request.max_tokens,
+                                            temperature: None,
+                                        },
+                                    )
+                                })
                                 .map(|generated| GenerateResponse {
                                     request_id: request.request_id,
                                     worker_id: String::new(),
@@ -85,6 +90,14 @@ impl WorkerRuntime {
                             events,
                             finished,
                         } => {
+                            let messages = match request.normalized_messages() {
+                                Ok(messages) => messages,
+                                Err(err) => {
+                                    let _ = events.blocking_send(Err(err.to_string()));
+                                    let _ = finished.send(());
+                                    continue;
+                                }
+                            };
                             let mut callback = |token: &str| {
                                 events
                                     .blocking_send(Ok(TokenEvent {
@@ -93,7 +106,8 @@ impl WorkerRuntime {
                                     .map_err(|_| anyhow::anyhow!("stream client disconnected"))
                             };
                             if let Err(err) = model.generate_with_callback(
-                                &request.prompt,
+                                &messages,
+                                request.template.as_deref(),
                                 GenerationConfig {
                                     max_tokens: request.max_tokens,
                                     temperature: None,

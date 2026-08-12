@@ -46,8 +46,11 @@ fn error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<Er
 }
 async fn generate(
     State(state): State<Arc<WorkerRuntime>>,
-    Json(request): Json<GenerateRequest>,
+    Json(mut request): Json<GenerateRequest>,
 ) -> impl IntoResponse {
+    if let Err(err) = normalize_request(&mut request) {
+        return error(StatusCode::BAD_REQUEST, err).into_response();
+    }
     if let Err(message) = state.try_reserve(&request.model) {
         return error(StatusCode::SERVICE_UNAVAILABLE, message).into_response();
     }
@@ -80,8 +83,11 @@ async fn generate(
 }
 async fn stream(
     State(state): State<Arc<WorkerRuntime>>,
-    Json(request): Json<GenerateRequest>,
+    Json(mut request): Json<GenerateRequest>,
 ) -> impl IntoResponse {
+    if let Err(err) = normalize_request(&mut request) {
+        return error(StatusCode::BAD_REQUEST, err).into_response();
+    }
     if let Err(message) = state.try_reserve(&request.model) {
         return error(StatusCode::SERVICE_UNAVAILABLE, message).into_response();
     }
@@ -115,4 +121,13 @@ async fn stream(
         release.release();
     });
     Sse::new(stream).into_response()
+}
+
+fn normalize_request(request: &mut GenerateRequest) -> Result<(), String> {
+    let messages = request
+        .normalized_messages()
+        .map_err(|err| err.to_string())?;
+    request.prompt = None;
+    request.messages = Some(messages);
+    Ok(())
 }
