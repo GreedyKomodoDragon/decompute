@@ -124,6 +124,7 @@ async fn stream(
 }
 
 fn normalize_request(request: &mut GenerateRequest) -> Result<(), String> {
+    request.validate_tools().map_err(|err| err.to_string())?;
     let messages = request
         .normalized_messages()
         .map_err(|err| err.to_string())?;

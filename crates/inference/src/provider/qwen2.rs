@@ -1,5 +1,8 @@
 use super::{CausalModelBackend, ModelProvider};
-use crate::descriptor::ModelDescriptor;
+use crate::{
+    descriptor::ModelDescriptor,
+    tool_calls::{QwenToolCallParser, ToolCallParser},
+};
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -11,6 +14,9 @@ pub struct Qwen2Provider;
 impl ModelProvider for Qwen2Provider {
     fn model_types(&self) -> &'static [&'static str] {
         &["qwen2"]
+    }
+    fn tool_call_parser(&self) -> &'static dyn ToolCallParser {
+        &QwenToolCallParser
     }
 
     fn load(

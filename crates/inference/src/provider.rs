@@ -1,6 +1,6 @@
 mod qwen2;
 
-use crate::descriptor::ModelDescriptor;
+use crate::{descriptor::ModelDescriptor, tool_calls::ToolCallParser};
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 
@@ -18,6 +18,12 @@ pub trait ModelProvider: Sync {
         device: &Device,
         dtype: DType,
     ) -> Result<Box<dyn CausalModelBackend>>;
+    fn tool_call_parser(&self) -> &'static dyn ToolCallParser;
+}
+
+pub struct LoadedProvider {
+    pub backend: Box<dyn CausalModelBackend>,
+    pub tool_call_parser: &'static dyn ToolCallParser,
 }
 
 pub struct ProviderRegistry {
@@ -36,7 +42,7 @@ impl ProviderRegistry {
         descriptor: &ModelDescriptor,
         device: &Device,
         dtype: DType,
-    ) -> Result<Box<dyn CausalModelBackend>> {
+    ) -> Result<LoadedProvider> {
         let provider = self
             .providers
             .iter()
@@ -52,7 +58,10 @@ impl ProviderRegistry {
                     self.supported_model_types().join(", ")
                 )
             })?;
-        provider.load(descriptor, device, dtype)
+        Ok(LoadedProvider {
+            backend: provider.load(descriptor, device, dtype)?,
+            tool_call_parser: provider.tool_call_parser(),
+        })
     }
 
     pub fn supported_model_types(&self) -> Vec<&'static str> {

@@ -4,11 +4,12 @@ use crate::{
     prompt_template::TemplateBundle,
     provider::{CausalModelBackend, ProviderRegistry},
     tokenizer,
+    tool_calls::ToolCallParser,
 };
 use anyhow::{Context, Result, bail};
 use candle_core::{DType, Device, Tensor};
 use candle_transformers::generation::LogitsProcessor;
-use protocol::{Acceleration, ChatMessage, HardwareInfo, ModelFile, ModelManifest};
+use protocol::{Acceleration, ChatMessage, HardwareInfo, ModelFile, ModelManifest, ToolDefinition};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -22,6 +23,7 @@ pub struct LocalModel {
     tokenizer: Tokenizer,
     templates: TemplateBundle,
     backend: Box<dyn CausalModelBackend>,
+    tool_call_parser: &'static dyn ToolCallParser,
     device: Device,
     end_tokens: Vec<u32>,
 }
@@ -36,7 +38,7 @@ impl LocalModel {
         let tokenizer = tokenizer::load(&descriptor.tokenizer_path)?;
         let templates = TemplateBundle::load(&descriptor)?;
         let dtype = execution_dtype(&descriptor.weight_paths[0], &device)?;
-        let backend = ProviderRegistry::builtin().load(&descriptor, &device, dtype)?;
+        let provider = ProviderRegistry::builtin().load(&descriptor, &device, dtype)?;
         let mut end_tokens = templates
             .eos_token()
             .into_iter()
@@ -48,7 +50,8 @@ impl LocalModel {
         Ok(Self {
             tokenizer,
             templates,
-            backend,
+            backend: provider.backend,
+            tool_call_parser: provider.tool_call_parser,
             device,
             end_tokens,
         })
@@ -58,19 +61,25 @@ impl LocalModel {
         &mut self,
         messages: &[ChatMessage],
         template: Option<&str>,
+        tools: &[ToolDefinition],
+        request_id: uuid::Uuid,
         config: GenerationConfig,
     ) -> Result<GenerationResult> {
-        self.generate_with_callback(messages, template, config, &mut |_| Ok(()))
+        self.generate_with_callback(messages, template, tools, request_id, config, &mut |_| {
+            Ok(())
+        })
     }
 
     pub fn generate_with_callback(
         &mut self,
         messages: &[ChatMessage],
         template: Option<&str>,
+        tools: &[ToolDefinition],
+        request_id: uuid::Uuid,
         config: GenerationConfig,
         callback: &mut TokenCallback<'_>,
     ) -> Result<GenerationResult> {
-        let prompt = self.templates.render(messages, template)?;
+        let prompt = self.templates.render(messages, template, tools)?;
         let encoding = self
             .tokenizer
             .encode(prompt, false)
@@ -107,10 +116,13 @@ impl LocalModel {
                 callback(&piece)?;
                 output.push_str(&piece);
             }
+            let parsed = self.tool_call_parser.parse(&output, tools, request_id)?;
             Ok(GenerationResult {
-                text: output,
+                text: parsed.text,
                 input_tokens,
                 output_tokens: tokens.len() - input_tokens,
+                tool_calls: parsed.tool_calls,
+                finish_reason: parsed.finish_reason,
             })
         })();
         self.backend.clear_kv_cache();

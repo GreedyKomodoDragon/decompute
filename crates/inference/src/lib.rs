@@ -4,6 +4,7 @@ pub mod model;
 pub mod prompt_template;
 pub mod provider;
 pub mod tokenizer;
+pub mod tool_calls;
 
 pub use generation::*;
 pub use model::*;

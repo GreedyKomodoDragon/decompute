@@ -69,6 +69,8 @@ impl WorkerRuntime {
                                     model.generate(
                                         &messages,
                                         request.template.as_deref(),
+                                        &request.tools,
+                                        request.request_id,
                                         GenerationConfig {
                                             max_tokens: request.max_tokens,
                                             temperature: None,
@@ -82,6 +84,8 @@ impl WorkerRuntime {
                                     text: generated.text,
                                     input_tokens: generated.input_tokens,
                                     output_tokens: generated.output_tokens,
+                                    tool_calls: generated.tool_calls,
+                                    finish_reason: generated.finish_reason,
                                 });
                             let _ = response.send(result);
                         }
@@ -108,6 +112,8 @@ impl WorkerRuntime {
                             if let Err(err) = model.generate_with_callback(
                                 &messages,
                                 request.template.as_deref(),
+                                &request.tools,
+                                request.request_id,
                                 GenerationConfig {
                                     max_tokens: request.max_tokens,
                                     temperature: None,

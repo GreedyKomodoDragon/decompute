@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use protocol::{PublicGenerateRequest, PublicGenerateResponse};
+use serde_json::json;
 
 #[derive(Parser)]
 struct Args {
@@ -18,21 +18,18 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let response = reqwest::Client::new()
         .post(format!(
-            "{}/v1/generate",
+            "{}/v1/chat/completions",
             args.coordinator.trim_end_matches('/')
         ))
-        .json(&PublicGenerateRequest {
-            request_id: None,
-            model: args.model,
-            prompt: Some(args.prompt),
-            messages: None,
-            template: None,
-            max_tokens: args.max_tokens,
-        })
+        .json(&json!({
+            "model": args.model,
+            "messages": [{"role": "user", "content": args.prompt}],
+            "max_tokens": args.max_tokens,
+        }))
         .send()
         .await?
         .error_for_status()?
-        .json::<PublicGenerateResponse>()
+        .json::<serde_json::Value>()
         .await?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())

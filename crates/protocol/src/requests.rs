@@ -7,12 +7,59 @@ pub enum ChatRole {
     System,
     User,
     Assistant,
+    Tool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    #[serde(rename = "type")]
+    pub kind: ToolType,
+    pub function: FunctionDefinition,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolType {
+    Function,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FunctionDefinition {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: ToolType,
+    pub function: FunctionCall,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishReason {
+    Stop,
+    ToolCalls,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -25,12 +72,18 @@ pub struct GenerateRequest {
     pub messages: Option<Vec<ChatMessage>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolDefinition>,
     pub max_tokens: usize,
 }
 
 impl GenerateRequest {
     pub fn normalized_messages(&self) -> Result<Vec<ChatMessage>, RequestValidationError> {
         normalize_messages(self.prompt.as_deref(), self.messages.as_deref())
+    }
+
+    pub fn validate_tools(&self) -> Result<(), RequestValidationError> {
+        validate_tools(&self.tools)
     }
 }
 
@@ -42,34 +95,9 @@ pub struct GenerateResponse {
     pub text: String,
     pub input_tokens: usize,
     pub output_tokens: usize,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PublicGenerateRequest {
-    pub request_id: Option<Uuid>,
-    pub model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub messages: Option<Vec<ChatMessage>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub template: Option<String>,
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: usize,
-}
-
-impl PublicGenerateRequest {
-    pub fn into_generate_request(self) -> Result<GenerateRequest, RequestValidationError> {
-        let messages = normalize_messages(self.prompt.as_deref(), self.messages.as_deref())?;
-        Ok(GenerateRequest {
-            request_id: self.request_id.unwrap_or_else(Uuid::new_v4),
-            model: self.model,
-            prompt: None,
-            messages: Some(messages),
-            template: self.template,
-            max_tokens: self.max_tokens,
-        })
-    }
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    pub finish_reason: FinishReason,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -78,6 +106,33 @@ pub enum RequestValidationError {
     ExactlyOneOfPromptOrMessages,
     #[error("messages must not be empty")]
     EmptyMessages,
+    #[error("tool name must use ASCII letters, digits, underscores, or hyphens")]
+    InvalidToolName,
+    #[error("tool names must be unique")]
+    DuplicateToolName,
+    #[error("tool parameters must be a JSON object")]
+    InvalidToolParameters,
+}
+
+pub fn validate_tools(tools: &[ToolDefinition]) -> Result<(), RequestValidationError> {
+    let mut names = std::collections::HashSet::new();
+    for tool in tools {
+        let name = &tool.function.name;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(RequestValidationError::InvalidToolName);
+        }
+        if !names.insert(name) {
+            return Err(RequestValidationError::DuplicateToolName);
+        }
+        if !tool.function.parameters.is_object() {
+            return Err(RequestValidationError::InvalidToolParameters);
+        }
+    }
+    Ok(())
 }
 
 fn normalize_messages(
@@ -88,44 +143,12 @@ fn normalize_messages(
         (Some(prompt), None) => Ok(vec![ChatMessage {
             role: ChatRole::User,
             content: prompt.to_owned(),
+            tool_calls: vec![],
+            tool_call_id: None,
         }]),
         (None, Some(messages)) if !messages.is_empty() => Ok(messages.to_vec()),
         (None, Some(_)) => Err(RequestValidationError::EmptyMessages),
         _ => Err(RequestValidationError::ExactlyOneOfPromptOrMessages),
-    }
-}
-
-const fn default_max_tokens() -> usize {
-    100
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Usage {
-    pub input_tokens: usize,
-    pub output_tokens: usize,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PublicGenerateResponse {
-    pub request_id: Uuid,
-    pub worker_id: String,
-    pub model: String,
-    pub text: String,
-    pub usage: Usage,
-}
-
-impl From<GenerateResponse> for PublicGenerateResponse {
-    fn from(response: GenerateResponse) -> Self {
-        Self {
-            request_id: response.request_id,
-            worker_id: response.worker_id,
-            model: response.model,
-            text: response.text,
-            usage: Usage {
-                input_tokens: response.input_tokens,
-                output_tokens: response.output_tokens,
-            },
-        }
     }
 }
 
@@ -144,7 +167,9 @@ mod tests {
             normalize_messages(Some("hello"), None).unwrap(),
             vec![ChatMessage {
                 role: ChatRole::User,
-                content: "hello".into()
+                content: "hello".into(),
+                tool_calls: vec![],
+                tool_call_id: None,
             }]
         );
     }
@@ -154,6 +179,8 @@ mod tests {
         let messages = vec![ChatMessage {
             role: ChatRole::User,
             content: "hello".into(),
+            tool_calls: vec![],
+            tool_call_id: None,
         }];
         assert_eq!(
             normalize_messages(None, None).unwrap_err(),
@@ -170,18 +197,19 @@ mod tests {
     }
 
     #[test]
-    fn preserves_selected_template_when_normalizing() {
-        let request = PublicGenerateRequest {
-            request_id: None,
-            model: "tiny-model".into(),
-            prompt: Some("hello".into()),
-            messages: None,
-            template: Some("rag".into()),
-            max_tokens: 10,
+    fn validates_tool_definitions() {
+        let tool = ToolDefinition {
+            kind: ToolType::Function,
+            function: FunctionDefinition {
+                name: "get-time".into(),
+                description: None,
+                parameters: serde_json::json!({"type": "object"}),
+            },
         };
+        assert!(validate_tools(&[tool.clone()]).is_ok());
         assert_eq!(
-            request.into_generate_request().unwrap().template.as_deref(),
-            Some("rag")
+            validate_tools(&[tool.clone(), tool]).unwrap_err(),
+            RequestValidationError::DuplicateToolName
         );
     }
 }

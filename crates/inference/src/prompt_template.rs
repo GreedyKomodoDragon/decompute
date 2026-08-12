@@ -1,7 +1,7 @@
 use crate::descriptor::ModelDescriptor;
 use anyhow::{Context, Result, bail};
 use minijinja::{AutoEscape, Environment, UndefinedBehavior, context};
-use protocol::ChatMessage;
+use protocol::{ChatMessage, ToolDefinition};
 use serde::Deserialize;
 use std::{collections::BTreeMap, fs};
 
@@ -54,7 +54,12 @@ impl TemplateBundle {
         })
     }
 
-    pub fn render(&self, messages: &[ChatMessage], template: Option<&str>) -> Result<String> {
+    pub fn render(
+        &self,
+        messages: &[ChatMessage],
+        template: Option<&str>,
+        tools: &[ToolDefinition],
+    ) -> Result<String> {
         let name = template.unwrap_or("default");
         if !self.names.iter().any(|available| available == name) {
             bail!(
@@ -68,7 +73,7 @@ impl TemplateBundle {
             .render(context! {
                 messages => messages,
                 add_generation_prompt => true,
-                tools => Vec::<serde_json::Value>::new(),
+                tools => tools,
                 eos_token => self.eos_token.as_deref(),
             })
             .with_context(|| format!("render chat template {name}"))
@@ -133,6 +138,8 @@ mod tests {
         vec![ChatMessage {
             role: ChatRole::User,
             content: "Hello".into(),
+            tool_calls: vec![],
+            tool_call_id: None,
         }]
     }
 
@@ -147,7 +154,7 @@ mod tests {
         assert_eq!(
             TemplateBundle::load(&descriptor(directory.path()))
                 .unwrap()
-                .render(&message(), None)
+                .render(&message(), None, &[])
                 .unwrap(),
             "Hello<eos>"
         );
@@ -169,8 +176,14 @@ mod tests {
         )
         .unwrap();
         let bundle = TemplateBundle::load(&descriptor(directory.path())).unwrap();
-        assert_eq!(bundle.render(&message(), None).unwrap(), "default:Hello");
-        assert_eq!(bundle.render(&message(), Some("rag")).unwrap(), "rag:Hello");
+        assert_eq!(
+            bundle.render(&message(), None, &[]).unwrap(),
+            "default:Hello"
+        );
+        assert_eq!(
+            bundle.render(&message(), Some("rag"), &[]).unwrap(),
+            "rag:Hello"
+        );
     }
 
     #[test]
@@ -189,9 +202,34 @@ mod tests {
         assert_eq!(
             TemplateBundle::load(&descriptor(directory.path()))
                 .unwrap()
-                .render(&message(), None)
+                .render(&message(), None, &[])
                 .unwrap(),
             "file:Hello"
+        );
+    }
+
+    #[test]
+    fn passes_tool_definitions_to_templates() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("tokenizer_config.json"),
+            r#"{"chat_template":"{% for tool in tools %}{{ tool.function.name }}{% endfor %}"}"#,
+        )
+        .unwrap();
+        let tools = vec![ToolDefinition {
+            kind: protocol::ToolType::Function,
+            function: protocol::FunctionDefinition {
+                name: "get_time".into(),
+                description: None,
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        }];
+        assert_eq!(
+            TemplateBundle::load(&descriptor(directory.path()))
+                .unwrap()
+                .render(&message(), None, &tools)
+                .unwrap(),
+            "get_time"
         );
     }
 }

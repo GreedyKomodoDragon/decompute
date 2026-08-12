@@ -1,19 +1,22 @@
-use crate::registry::Registry;
-use async_stream::stream;
+use crate::{
+    openai::{
+        self, ChatCompletionRequest, ChatCompletionResponse, ErrorResponse, Model, ModelsResponse,
+    },
+    registry::Registry,
+};
 use axum::{
     Json, Router,
-    body::Body,
     extract::{Path, State},
-    http::{StatusCode, header},
-    response::IntoResponse,
+    http::StatusCode,
+    response::{
+        IntoResponse,
+        sse::{Event, Sse},
+    },
     routing::{get, post},
 };
-use futures_util::StreamExt;
-use protocol::{
-    ErrorResponse, GenerateRequest, HeartbeatRequest, PublicGenerateRequest,
-    PublicGenerateResponse, RegisterWorkerRequest,
-};
-use std::{io, sync::Arc};
+use futures_util::{StreamExt, stream};
+use protocol::{GenerateRequest, GenerateResponse, HeartbeatRequest, RegisterWorkerRequest};
+use std::{convert::Infallible, sync::Arc};
 use tracing::info;
 
 pub fn router(registry: Arc<Registry>) -> Router {
@@ -21,18 +24,11 @@ pub fn router(registry: Arc<Registry>) -> Router {
         .route("/workers/register", post(register))
         .route("/workers/{id}/heartbeat", post(heartbeat))
         .route("/workers", get(list))
-        .route("/v1/generate", post(generate))
-        .route("/v1/generate/stream", post(stream_generate))
+        .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(chat_completions))
         .with_state(registry)
 }
-fn error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
-    (
-        status,
-        Json(ErrorResponse {
-            error: message.into(),
-        }),
-    )
-}
+
 async fn register(
     State(registry): State<Arc<Registry>>,
     Json(request): Json<RegisterWorkerRequest>,
@@ -40,6 +36,7 @@ async fn register(
     registry.register(request).await;
     StatusCode::CREATED
 }
+
 async fn heartbeat(
     State(registry): State<Arc<Registry>>,
     Path(id): Path<String>,
@@ -51,117 +48,103 @@ async fn heartbeat(
         StatusCode::NOT_FOUND
     }
 }
+
 async fn list(State(registry): State<Arc<Registry>>) -> Json<Vec<crate::registry::WorkerRecord>> {
     Json(registry.list().await)
 }
 
-fn request(
-    request: PublicGenerateRequest,
-) -> Result<GenerateRequest, protocol::RequestValidationError> {
-    request.into_generate_request()
+async fn models(State(registry): State<Arc<Registry>>) -> Json<ModelsResponse> {
+    Json(ModelsResponse {
+        object: "list",
+        data: registry
+            .available_models()
+            .await
+            .into_iter()
+            .map(|id| Model {
+                id,
+                object: "model",
+                owned_by: "decompute",
+            })
+            .collect(),
+    })
 }
-async fn generate(
+
+async fn chat_completions(
     State(registry): State<Arc<Registry>>,
-    Json(public): Json<PublicGenerateRequest>,
+    Json(public): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
-    let request = match request(public) {
+    let stream = public.stream;
+    let model = public.model.clone();
+    let request = match GenerateRequest::try_from(public) {
         Ok(request) => request,
-        Err(err) => return error(StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+        Err(err) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                ErrorResponse::invalid_request(err.to_string()),
+            )
+            .into_response();
+        }
     };
+    let response = match route_request(&registry, request).await {
+        Ok(response) => response,
+        Err((status, message)) => {
+            return openai_error(status, ErrorResponse::server_error(message)).into_response();
+        }
+    };
+    if stream {
+        let events = stream::iter(openai::chunks(model, response))
+            .map(|chunk| {
+                Ok::<_, Infallible>(
+                    Event::default().data(serde_json::to_string(&chunk).unwrap_or_default()),
+                )
+            })
+            .chain(stream::iter([Ok(Event::default().data("[DONE]"))]));
+        Sse::new(events).into_response()
+    } else {
+        Json(ChatCompletionResponse::from_generate(model, response)).into_response()
+    }
+}
+
+async fn route_request(
+    registry: &Arc<Registry>,
+    request: GenerateRequest,
+) -> Result<GenerateResponse, (StatusCode, String)> {
     let Some(worker) = registry.select_and_reserve(&request.model).await else {
-        return error(
+        return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "no eligible worker has the requested model",
-        )
-        .into_response();
+            "no eligible worker has the requested model".into(),
+        ));
     };
-    info!(request_id = %request.request_id, worker = %worker.id, model = %request.model, "routing inference request");
-    let response = reqwest::Client::new()
+    info!(request_id = %request.request_id, worker = %worker.id, model = %request.model, "routing OpenAI-compatible inference request");
+    let result = reqwest::Client::new()
         .post(format!("{}/generate", worker.address.trim_end_matches('/')))
         .json(&request)
         .send()
         .await;
     registry.release(&worker.id).await;
-    match response {
+    match result {
         Ok(response) if response.status().is_success() => {
-            match response.json::<protocol::GenerateResponse>().await {
-                Ok(value) => Json(PublicGenerateResponse::from(value)).into_response(),
-                Err(err) => error(
+            response.json::<GenerateResponse>().await.map_err(|err| {
+                (
                     StatusCode::BAD_GATEWAY,
                     format!("invalid worker response: {err}"),
                 )
-                .into_response(),
-            }
+            })
         }
-        Ok(response) => error(
+        Ok(response) => Err((
             StatusCode::BAD_GATEWAY,
             format!("worker returned {}", response.status()),
-        )
-        .into_response(),
+        )),
         Err(err) => {
             registry.mark_offline(&worker.id).await;
-            error(
+            Err((
                 StatusCode::BAD_GATEWAY,
                 format!("worker request failed: {err}"),
-            )
-            .into_response()
+            ))
         }
     }
 }
-async fn stream_generate(
-    State(registry): State<Arc<Registry>>,
-    Json(public): Json<PublicGenerateRequest>,
-) -> impl IntoResponse {
-    let request = match request(public) {
-        Ok(request) => request,
-        Err(err) => return error(StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-    let Some(worker) = registry.select_and_reserve(&request.model).await else {
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no eligible worker has the requested model",
-        )
-        .into_response();
-    };
-    let response = match reqwest::Client::new()
-        .post(format!(
-            "{}/generate/stream",
-            worker.address.trim_end_matches('/')
-        ))
-        .json(&request)
-        .send()
-        .await
-    {
-        Ok(value) if value.status().is_success() => value,
-        Ok(value) => {
-            registry.release(&worker.id).await;
-            return error(
-                StatusCode::BAD_GATEWAY,
-                format!("worker returned {}", value.status()),
-            )
-            .into_response();
-        }
-        Err(err) => {
-            registry.mark_offline(&worker.id).await;
-            registry.release(&worker.id).await;
-            return error(
-                StatusCode::BAD_GATEWAY,
-                format!("worker request failed: {err}"),
-            )
-            .into_response();
-        }
-    };
-    let worker_id = worker.id.clone();
-    let release_registry = registry.clone();
-    let body = Body::from_stream(
-        stream! { let mut bytes = response.bytes_stream(); while let Some(chunk) = bytes.next().await { match chunk { Ok(chunk) => yield Ok::<_, io::Error>(chunk), Err(err) => { yield Err(io::Error::other(err)); break; } } } release_registry.release(&worker_id).await; },
-    );
-    (
-        [
-            (header::CONTENT_TYPE, "text/event-stream"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        body,
-    )
-        .into_response()
+
+fn openai_error(status: StatusCode, error: ErrorResponse) -> (StatusCode, Json<ErrorResponse>) {
+    (status, Json(error))
 }

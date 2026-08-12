@@ -1,4 +1,4 @@
-use protocol::{HeartbeatRequest, RegisterWorkerRequest, WorkerState};
+use protocol::{HeartbeatRequest, ModelStatus, RegisterWorkerRequest, WorkerState};
 use std::{
     collections::HashMap,
     time::{Duration, Instant},
@@ -62,6 +62,21 @@ impl Registry {
     }
     pub async fn list(&self) -> Vec<WorkerRecord> {
         self.workers.read().await.values().cloned().collect()
+    }
+    pub async fn available_models(&self) -> Vec<String> {
+        let mut models = self
+            .workers
+            .read()
+            .await
+            .values()
+            .filter(|worker| worker.state != WorkerState::Offline)
+            .flat_map(|worker| worker.models.iter())
+            .filter(|model| model.status == ModelStatus::Loaded)
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>();
+        models.sort();
+        models.dedup();
+        models
     }
     pub async fn select_and_reserve(&self, model: &str) -> Option<SelectedWorker> {
         let mut workers = self.workers.write().await;

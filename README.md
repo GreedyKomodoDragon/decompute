@@ -16,8 +16,8 @@ The coordinator only understands HTTP and the shared protocol. Candle, tokenizat
 | `inference` | Local model runtime. It loads the Qwen config, tokenizer, chat template, and safetensors weights; selects a compatible execution dtype for the device; generates tokens; calculates model manifests; and reports hardware basics. This is the only library crate that knows Candle. |
 | `inference-example` | Small executable for proving local inference before networking. It loads `./models/tiny-model` and prints generated text. |
 | `worker` | Process that owns a complete local model. Its Axum server exposes health, capabilities, generation, SSE streaming, and draining endpoints. A dedicated OS thread owns the model and receives jobs over a channel, so blocking inference never occupies Tokio worker threads. It registers with the coordinator and heartbeats every five seconds. |
-| `coordinator` | Inference-library-free Axum service. It stores worker records, expires stale heartbeats, selects the least-busy eligible worker with an exact model match, forwards requests with Reqwest, and proxies SSE streams. |
-| `client` | Small CLI client for the coordinator's non-streaming public generation endpoint. `curl` remains the simplest way to exercise the HTTP API. |
+| `coordinator` | Inference-library-free Axum service. It exposes an OpenAI Chat Completions-compatible API, stores worker records, expires stale heartbeats, selects the least-busy eligible worker with an exact model match, and proxies private inference requests. |
+| `client` | Small CLI client for the coordinator's OpenAI-compatible endpoint. `curl` or OpenCode are the preferred API clients. |
 
 The process boundary is deliberate: moving a worker to another machine only changes its bind/advertise address; neither the coordinator nor protocol needs to know how the model is executed.
 
@@ -58,25 +58,25 @@ cargo run -p worker -- --port 9002 --node-id worker-b --coordinator http://127.0
 ```
 
 ```bash
-curl http://127.0.0.1:8000/v1/generate \
+curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"tiny-model","prompt":"Why is the sky blue?","max_tokens":100}'
+  -d '{"model":"tiny-model","messages":[{"role":"user","content":"Why is the sky blue?"}],"max_tokens":100}'
 ```
 
-The public endpoint creates a UUID if `request_id` is omitted and responds with the selected worker, text, and nested token usage. Inspect the registry with `curl http://127.0.0.1:8000/workers`.
+The public API is OpenAI Chat Completions-compatible: `POST /v1/chat/completions` and `GET /v1/models`. The coordinator selects a worker and proxies a private request; clients never receive worker addresses. Inspect the internal registry with `curl http://127.0.0.1:8000/workers`.
 
 ### Chat messages and model templates
 
-Requests accept exactly one of `prompt` or `messages`. `prompt` remains compatible with the original API and is internally converted into one `user` message:
+Requests use standard OpenAI `messages`:
 
 ```json
-{"model":"tiny-model","prompt":"Why is the sky blue?","max_tokens":100}
+{"model":"tiny-model","messages":[{"role":"user","content":"Why is the sky blue?"}],"max_tokens":100}
 ```
 
 For system instructions and chat history, pass structured messages:
 
 ```bash
-curl http://127.0.0.1:8000/v1/generate \
+curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "tiny-model",
@@ -90,7 +90,60 @@ curl http://127.0.0.1:8000/v1/generate \
 
 At model load, the worker reads the Hugging Face `chat_template` from `tokenizer_config.json` and compiles it with MiniJinja. It renders the normalized messages with `add_generation_prompt: true`, then passes the rendered text to that model's `tokenizer.json`. This replaces the prior hard-coded Qwen prompt wrapper. The template renderer is independent of Candle model execution, so a later architecture adapter can reuse it for another supported model family.
 
-For safety, templates have no filesystem loader or host callbacks. This first version passes `tools: []`; tool calls and multimodal message content are intentionally unsupported.
+For safety, templates have no filesystem loader or host callbacks. Multimodal message content is intentionally unsupported.
+
+### Tool-call proposals (Qwen)
+
+The Qwen2.5 template bundled with the selected model supports OpenAI-style function definitions. Send a `tools` array with structured messages; Qwen can return one or more proposed calls. The worker parses Qwen's `<tool_call>…</tool_call>` output and the coordinator returns it unchanged. Neither component executes a tool.
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "tiny-model",
+    "messages": [{"role": "user", "content": "What time is it in London?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_time",
+        "description": "Get the current time in an IANA timezone.",
+        "parameters": {
+          "type": "object",
+          "properties": {"timezone": {"type": "string"}},
+          "required": ["timezone"]
+        }
+      }
+    }],
+    "max_tokens": 100
+  }'
+```
+
+A successful proposal has `choices[0].finish_reason: "tool_calls"` and `choices[0].message.tool_calls`. Each call has a deterministic request-scoped ID, a function name, and JSON-encoded arguments:
+
+```json
+{
+  "choices": [{
+    "finish_reason": "tool_calls",
+    "message": {"tool_calls": [{
+    "id": "<request-id>-0",
+    "type": "function",
+    "function": {"name": "get_time", "arguments": "{\"timezone\":\"Europe/London\"}"}
+  }]}}
+  ]
+}
+```
+
+The client owns the execution loop: validate and execute each proposed call in its own trusted environment, then submit a follow-up OpenAI `messages` request containing the assistant `tool_calls` and one `tool` message per result. The Qwen template already renders that history. Tool names must be unique ASCII letters, digits, `_`, or `-`; each `parameters` value must be a JSON object.
+
+### OpenCode
+
+Copy [`examples/opencode.json`](examples/opencode.json) into your OpenCode project configuration (or merge its `providers.decompute` entry with your existing configuration). With the coordinator and at least one worker running, use:
+
+```bash
+opencode run --model decompute/tiny-model "Explain this repository and suggest one small improvement."
+```
+
+Use the model ID returned by `GET /v1/models` if your workers advertise a different model. OpenCode communicates only with the coordinator. It executes file, shell, and other coding tools on the OpenCode machine; Decompute workers only receive private model-inference requests.
 
 ### Providers and named templates
 
@@ -113,7 +166,7 @@ Choose a named template explicitly when the model provides one:
 
 If no `template` is supplied, the worker uses `default`. Unknown names return a clear error listing the templates packaged by that model.
 
-For streaming, use `curl -N` against `/v1/generate/stream` with the same JSON body. It proxies worker SSE frames and ends with `data: [DONE]`.
+For streaming, add `"stream": true` to `POST /v1/chat/completions`. The coordinator returns OpenAI-style Server-Sent Events and ends with `data: [DONE]`.
 
 Drain a worker without killing an in-flight request:
 
