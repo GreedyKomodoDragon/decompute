@@ -9,7 +9,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use protocol::{ErrorResponse, GenerateRequest, TokenEvent};
+use protocol::{ErrorResponse, GenerateRequest, GenerationStreamEvent};
 use std::{convert::Infallible, sync::Arc};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
@@ -73,7 +73,10 @@ async fn generate(
             response.worker_id = state.node_id.clone();
             Json(response).into_response()
         }
-        Ok(Err(err)) => error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+        Ok(Err(err)) => {
+            tracing::error!(error = %format!("{err:#}"), "inference failed");
+            error(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")).into_response()
+        }
         Err(_) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "inference response dropped",
@@ -91,8 +94,9 @@ async fn stream(
     if let Err(message) = state.try_reserve(&request.model) {
         return error(StatusCode::SERVICE_UNAVAILABLE, message).into_response();
     }
-    let (tx, rx) = mpsc::channel::<Result<TokenEvent, String>>(32);
+    let (tx, rx) = mpsc::channel::<GenerationStreamEvent>(32);
     let (finished_tx, finished_rx) = oneshot::channel();
+    info!(request_id = %request.request_id, model = %request.model, "accepted streamed inference request");
     if let Err(message) = state
         .submit(InferenceJob::Stream {
             request,
@@ -107,13 +111,9 @@ async fn stream(
     let release = state.clone();
     let stream = ReceiverStream::new(rx)
         .map(move |event| {
-            let event = match event {
-                Ok(token) => {
-                    Event::default().data(serde_json::to_string(&token).unwrap_or_default())
-                }
-                Err(message) => Event::default().event("error").data(message),
-            };
-            Ok::<_, Infallible>(event)
+            Ok::<_, Infallible>(
+                Event::default().data(serde_json::to_string(&event).unwrap_or_default()),
+            )
         })
         .chain(tokio_stream::once(Ok(Event::default().data("[DONE]"))));
     tokio::spawn(async move {

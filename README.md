@@ -137,13 +137,26 @@ The client owns the execution loop: validate and execute each proposed call in i
 
 ### OpenCode
 
-Copy [`examples/opencode.json`](examples/opencode.json) into your OpenCode project configuration (or merge its `providers.decompute` entry with your existing configuration). With the coordinator and at least one worker running, use:
+Copy [`examples/opencode.json`](examples/opencode.json) into your OpenCode project configuration (or merge its `provider.decompute` entry with your existing configuration). With the coordinator and at least one worker running, use:
 
 ```bash
 opencode run --model decompute/tiny-model "Explain this repository and suggest one small improvement."
 ```
 
 Use the model ID returned by `GET /v1/models` if your workers advertise a different model. OpenCode communicates only with the coordinator. It executes file, shell, and other coding tools on the OpenCode machine; Decompute workers only receive private model-inference requests.
+
+### Pi
+
+Pi can use the same OpenAI-compatible coordinator. Merge the `decompute` provider from [`examples/pi-models.json`](examples/pi-models.json) into `~/.pi/agent/models.json`, then make a deliberately small no-tools request while testing CPU inference:
+
+```bash
+pi --provider decompute --model tiny-model \
+  --no-session --no-tools \
+  --system-prompt 'Reply concisely.' \
+  --print 'Reply with exactly: hello'
+```
+
+The sample declares a 2,048-token context window and 96-token output limit. Those limits keep Pi's initial tests within the practical range of CPU inference; increase them only after an accelerator path is available.
 
 ### Providers and named templates
 
@@ -166,7 +179,7 @@ Choose a named template explicitly when the model provides one:
 
 If no `template` is supplied, the worker uses `default`. Unknown names return a clear error listing the templates packaged by that model.
 
-For streaming, add `"stream": true` to `POST /v1/chat/completions`. The coordinator returns OpenAI-style Server-Sent Events and ends with `data: [DONE]`.
+For streaming, add `"stream": true` to `POST /v1/chat/completions`. Visible text is forwarded from the worker through the coordinator as it is generated, using OpenAI-style Server-Sent Events and a final `data: [DONE]`. Qwen tool-call markup is withheld until generation completes, then emitted as structured OpenAI tool-call chunks.
 
 Drain a worker without killing an in-flight request:
 
@@ -187,7 +200,7 @@ No transport or protocol changes are needed; this prototype intentionally does n
 
 ## Devices and identity
 
-CPU is the default. The worker inspects the safetensors header to determine its stored weight dtype. F32 weights remain F32; BF16/F16 weights are promoted to F32 on CPU because Candle CPU matmul cannot execute BF16. The worker reports basic architecture/RAM information and hashes `config.json`, `tokenizer.json`, and `model.safetensors` into a deterministic manifest ID. It currently routes the user-friendly `tiny-model` alias.
+The worker reads both Hugging Face `config.json` (`torch_dtype`) and the safetensors header. The safetensors dtype is authoritative for stored weights; a disagreement with the declared dtype fails startup rather than loading an ambiguous model. Each inference provider declares its safe runtime precisions for CPU, Metal, and future CUDA. For this BF16 Qwen checkpoint, CPU uses F32 and Metal uses F16. The worker runs a one-token smoke test before registering, so a backend/kernel failure never creates an apparently healthy worker.
 
 Apple Metal is optional and does not alter the network protocol. Build with the feature and explicitly select Metal:
 
@@ -200,4 +213,4 @@ cargo run -p worker --features metal -- \
   --model ./models/tiny-model
 ```
 
-`--device auto` uses Metal when the feature is compiled and initialization succeeds, otherwise it falls back to CPU. CUDA is not implemented yet; its protocol enum is reserved for later worker support.
+`--device auto` probes Metal when compiled, verifies it with the smoke test, then falls back to CPU if the probe fails. An explicit `--device metal` never falls back silently: it fails startup with the full compatibility error. CUDA is not implemented yet; its protocol enum is reserved for later worker support.

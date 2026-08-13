@@ -1,8 +1,8 @@
 use anyhow::Result;
 use inference::{GenerationConfig, LocalModel};
 use protocol::{
-    Acceleration, GenerateRequest, GenerateResponse, ModelCapability, ModelManifest, ModelStatus,
-    TokenEvent, WorkerCapabilities, WorkerState,
+    Acceleration, GenerateRequest, GenerateResponse, GenerationStreamEvent, ModelCapability,
+    ModelManifest, ModelStatus, WorkerCapabilities, WorkerState,
 };
 use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -17,7 +17,7 @@ pub enum InferenceJob {
     },
     Stream {
         request: GenerateRequest,
-        events: mpsc::Sender<Result<TokenEvent, String>>,
+        events: mpsc::Sender<GenerationStreamEvent>,
         finished: oneshot::Sender<()>,
     },
 }
@@ -62,6 +62,7 @@ impl WorkerRuntime {
                 while let Some(job) = receiver.blocking_recv() {
                     match job {
                         InferenceJob::Generate { request, response } => {
+                            tracing::info!(request_id = %request.request_id, model = %request.model, "inference thread started request");
                             let result = request
                                 .normalized_messages()
                                 .map_err(anyhow::Error::msg)
@@ -94,22 +95,26 @@ impl WorkerRuntime {
                             events,
                             finished,
                         } => {
+                            tracing::info!(request_id = %request.request_id, model = %request.model, "inference thread started streamed request");
                             let messages = match request.normalized_messages() {
                                 Ok(messages) => messages,
                                 Err(err) => {
-                                    let _ = events.blocking_send(Err(err.to_string()));
+                                    tracing::error!(error = %format!("{err:#}"), "streamed inference failed");
+                                    let _ = events.blocking_send(GenerationStreamEvent::Error {
+                                        message: format!("{err:#}"),
+                                    });
                                     let _ = finished.send(());
                                     continue;
                                 }
                             };
                             let mut callback = |token: &str| {
                                 events
-                                    .blocking_send(Ok(TokenEvent {
-                                        token: token.to_owned(),
-                                    }))
+                                    .blocking_send(GenerationStreamEvent::TextDelta {
+                                        text: token.to_owned(),
+                                    })
                                     .map_err(|_| anyhow::anyhow!("stream client disconnected"))
                             };
-                            if let Err(err) = model.generate_with_callback(
+                            match model.generate_with_callback(
                                 &messages,
                                 request.template.as_deref(),
                                 &request.tools,
@@ -120,7 +125,32 @@ impl WorkerRuntime {
                                 },
                                 &mut callback,
                             ) {
-                                let _ = events.blocking_send(Err(err.to_string()));
+                                Ok(generated) => {
+                                    tracing::info!(
+                                        request_id = %request.request_id,
+                                        output_tokens = generated.output_tokens,
+                                        tool_calls = generated.tool_calls.len(),
+                                        finish_reason = ?generated.finish_reason,
+                                        "inference thread completed streamed request"
+                                    );
+                                    let _ =
+                                        events.blocking_send(GenerationStreamEvent::Completed {
+                                            input_tokens: generated.input_tokens,
+                                            output_tokens: generated.output_tokens,
+                                            tool_calls: generated.tool_calls,
+                                            finish_reason: generated.finish_reason,
+                                        });
+                                }
+                                Err(err) => {
+                                    tracing::error!(
+                                        request_id = %request.request_id,
+                                        error = %format!("{err:#}"),
+                                        "inference thread failed streamed request"
+                                    );
+                                    let _ = events.blocking_send(GenerationStreamEvent::Error {
+                                        message: format!("{err:#}"),
+                                    });
+                                }
                             }
                             let _ = finished.send(());
                         }

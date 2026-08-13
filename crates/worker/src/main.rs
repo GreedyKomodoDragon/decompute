@@ -45,26 +45,48 @@ enum DeviceChoice {
 
 fn load_model(args: &Args) -> Result<(LocalModel, Acceleration)> {
     match args.device {
-        DeviceChoice::Cpu => Ok((LocalModel::load(&args.model)?, Acceleration::Cpu)),
+        DeviceChoice::Cpu => {
+            load_and_verify(&args.model, candle_core::Device::Cpu, Acceleration::Cpu)
+        }
         DeviceChoice::Metal => load_metal(&args.model),
         DeviceChoice::Auto => {
             #[cfg(feature = "metal")]
             if let Ok(device) = candle_core::Device::new_metal(0) {
-                if let Ok(model) = LocalModel::load_on_device(&args.model, device) {
-                    return Ok((model, Acceleration::Metal));
+                match load_and_verify(&args.model, device, Acceleration::Metal) {
+                    Ok(model) => return Ok(model),
+                    Err(err) => {
+                        tracing::warn!(error = %format!("{err:#}"), "Metal model probe failed; falling back to CPU")
+                    }
                 }
             }
-            Ok((LocalModel::load(&args.model)?, Acceleration::Cpu))
+            load_and_verify(&args.model, candle_core::Device::Cpu, Acceleration::Cpu)
         }
     }
 }
 
+fn load_and_verify(
+    path: &str,
+    device: candle_core::Device,
+    acceleration: Acceleration,
+) -> Result<(LocalModel, Acceleration)> {
+    let mut model = LocalModel::load_on_device(path, device)?;
+    info!(
+        target = %model.execution_plan().target,
+        stored_precision = %model.execution_plan().stored_precision,
+        runtime_precision = %model.execution_plan().runtime_precision,
+        "selected model execution plan"
+    );
+    model.smoke_test()?;
+    Ok((model, acceleration))
+}
+
 #[cfg(feature = "metal")]
 fn load_metal(path: &str) -> Result<(LocalModel, Acceleration)> {
-    Ok((
-        LocalModel::load_on_device(path, candle_core::Device::new_metal(0)?)?,
+    load_and_verify(
+        path,
+        candle_core::Device::new_metal(0)?,
         Acceleration::Metal,
-    ))
+    )
 }
 #[cfg(not(feature = "metal"))]
 fn load_metal(_path: &str) -> Result<(LocalModel, Acceleration)> {

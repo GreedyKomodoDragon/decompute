@@ -127,6 +127,8 @@ mod tests {
         ModelDescriptor {
             directory: directory.into(),
             model_type: "qwen2".into(),
+            declared_precision: None,
+            stored_precision: crate::execution::ModelPrecision::F32,
             config_path: PathBuf::new(),
             tokenizer_path: PathBuf::new(),
             tokenizer_config_path: directory.join("tokenizer_config.json"),

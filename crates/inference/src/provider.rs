@@ -1,6 +1,10 @@
 mod qwen2;
 
-use crate::{descriptor::ModelDescriptor, tool_calls::ToolCallParser};
+use crate::{
+    descriptor::ModelDescriptor,
+    execution::{ExecutionPlan, ExecutionTarget, ModelPrecision, resolve_execution_plan},
+    tool_calls::ToolCallParser,
+};
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 
@@ -19,6 +23,7 @@ pub trait ModelProvider: Sync {
         dtype: DType,
     ) -> Result<Box<dyn CausalModelBackend>>;
     fn tool_call_parser(&self) -> &'static dyn ToolCallParser;
+    fn supported_runtime_precisions(&self, target: ExecutionTarget) -> &'static [ModelPrecision];
 }
 
 pub struct LoadedProvider {
@@ -64,6 +69,37 @@ impl ProviderRegistry {
         })
     }
 
+    pub fn execution_plan(
+        &self,
+        descriptor: &ModelDescriptor,
+        target: ExecutionTarget,
+    ) -> Result<ExecutionPlan> {
+        let provider = self.provider_for(descriptor)?;
+        resolve_execution_plan(
+            descriptor,
+            target,
+            provider.supported_runtime_precisions(target),
+        )
+    }
+
+    fn provider_for(&self, descriptor: &ModelDescriptor) -> Result<&'static dyn ModelProvider> {
+        self.providers
+            .iter()
+            .find(|provider| {
+                provider
+                    .model_types()
+                    .contains(&descriptor.model_type.as_str())
+            })
+            .copied()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unsupported model_type {}; supported types: {}",
+                    descriptor.model_type,
+                    self.supported_model_types().join(", ")
+                )
+            })
+    }
+
     pub fn supported_model_types(&self) -> Vec<&'static str> {
         self.providers
             .iter()
@@ -82,6 +118,8 @@ mod tests {
         let descriptor = ModelDescriptor {
             directory: PathBuf::new(),
             model_type: "unknown".into(),
+            declared_precision: None,
+            stored_precision: ModelPrecision::F32,
             config_path: PathBuf::new(),
             tokenizer_path: PathBuf::new(),
             tokenizer_config_path: PathBuf::new(),

@@ -1,0 +1,30 @@
+{
+  "providers": {
+    "decompute": {
+      "baseUrl": "http://127.0.0.1:8000/v1",
+      "api": "openai-completions",
+      "apiKey": "decompute-local",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false,
+        "maxTokensField": "max_tokens"
+      },
+      "models": [
+        {
+          "id": "tiny-model",
+          "name": "Decompute Tiny Model (Local)",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 2048,
+          "maxTokens": 96,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        }
+      ]
+    }
+  }
+}

@@ -17,6 +17,15 @@ pub trait ToolCallParser: Send + Sync {
         tools: &[ToolDefinition],
         request_id: Uuid,
     ) -> Result<ParsedToolCalls>;
+
+    fn stream_filter(&self) -> Box<dyn StreamingOutputFilter>;
+}
+
+/// Removes provider control markup before it crosses the worker HTTP boundary.
+/// The complete raw output is still parsed at generation completion.
+pub trait StreamingOutputFilter: Send {
+    fn push(&mut self, fragment: &str) -> String;
+    fn finish(&mut self) -> String;
 }
 
 pub struct PlainTextToolCallParser;
@@ -33,6 +42,23 @@ impl ToolCallParser for PlainTextToolCallParser {
             tool_calls: vec![],
             finish_reason: FinishReason::Stop,
         })
+    }
+
+    fn stream_filter(&self) -> Box<dyn StreamingOutputFilter> {
+        Box::<PlainTextStreamFilter>::default()
+    }
+}
+
+#[derive(Default)]
+struct PlainTextStreamFilter;
+
+impl StreamingOutputFilter for PlainTextStreamFilter {
+    fn push(&mut self, fragment: &str) -> String {
+        fragment.to_owned()
+    }
+
+    fn finish(&mut self) -> String {
+        String::new()
     }
 }
 
@@ -102,6 +128,58 @@ impl ToolCallParser for QwenToolCallParser {
             finish_reason,
         })
     }
+
+    fn stream_filter(&self) -> Box<dyn StreamingOutputFilter> {
+        Box::<QwenStreamFilter>::default()
+    }
+}
+
+#[derive(Default)]
+struct QwenStreamFilter {
+    pending: String,
+    inside_tool_call: bool,
+}
+
+impl StreamingOutputFilter for QwenStreamFilter {
+    fn push(&mut self, fragment: &str) -> String {
+        const START: &str = "<tool_call>";
+        const END: &str = "</tool_call>";
+        self.pending.push_str(fragment);
+        let mut visible = String::new();
+        loop {
+            let marker = if self.inside_tool_call { END } else { START };
+            if let Some(position) = self.pending.find(marker) {
+                if !self.inside_tool_call {
+                    visible.push_str(&self.pending[..position]);
+                }
+                self.pending.drain(..position + marker.len());
+                self.inside_tool_call = !self.inside_tool_call;
+                continue;
+            }
+            let retained = marker_prefix_suffix_len(&self.pending, marker);
+            let emit_len = self.pending.len() - retained;
+            if !self.inside_tool_call {
+                visible.push_str(&self.pending[..emit_len]);
+            }
+            self.pending.drain(..emit_len);
+            return visible;
+        }
+    }
+
+    fn finish(&mut self) -> String {
+        if self.inside_tool_call {
+            self.pending.clear();
+            return String::new();
+        }
+        std::mem::take(&mut self.pending)
+    }
+}
+
+fn marker_prefix_suffix_len(value: &str, marker: &str) -> usize {
+    (1..marker.len().min(value.len()) + 1)
+        .rev()
+        .find(|length| value.ends_with(&marker[..*length]))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -138,5 +216,14 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn stream_filter_hides_fragmented_qwen_tool_markup() {
+        let mut filter = QwenToolCallParser.stream_filter();
+        assert_eq!(filter.push("Before <tool"), "Before ");
+        assert_eq!(filter.push("_call>{\"name\":\"get_time\"}"), "");
+        assert_eq!(filter.push("</tool_call> after"), " after");
+        assert_eq!(filter.finish(), "");
     }
 }

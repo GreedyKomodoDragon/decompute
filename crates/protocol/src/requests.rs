@@ -152,9 +152,23 @@ fn normalize_messages(
     }
 }
 
+/// Private worker-to-coordinator streaming events. These are never exposed as
+/// the public OpenAI-compatible wire format.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TokenEvent {
-    pub token: String,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GenerationStreamEvent {
+    TextDelta {
+        text: String,
+    },
+    Completed {
+        input_tokens: usize,
+        output_tokens: usize,
+        tool_calls: Vec<ToolCall>,
+        finish_reason: FinishReason,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[cfg(test)]

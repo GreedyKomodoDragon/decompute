@@ -300,64 +300,95 @@ pub struct ChunkToolCall {
     pub function: OpenAiFunctionCallResponse,
 }
 
-pub fn chunks(model: String, response: GenerateResponse) -> Vec<ChatCompletionChunk> {
-    let id = format!("chatcmpl-{}", response.request_id);
-    let created = created();
-    let mut chunks = vec![chunk(
-        &id,
-        created,
-        &model,
-        AssistantDelta {
-            role: Some("assistant"),
-            ..Default::default()
-        },
-        None,
-        None,
-    )];
-    if !response.text.is_empty() {
-        chunks.push(chunk(
-            &id,
-            created,
-            &model,
+pub struct StreamContext {
+    id: String,
+    created: u64,
+    model: String,
+}
+
+impl StreamContext {
+    pub fn new(model: String, request_id: Uuid) -> Self {
+        Self {
+            id: format!("chatcmpl-{request_id}"),
+            created: created(),
+            model,
+        }
+    }
+
+    pub fn role(&self) -> ChatCompletionChunk {
+        self.chunk(
             AssistantDelta {
-                content: Some(response.text),
+                role: Some("assistant"),
                 ..Default::default()
             },
             None,
             None,
-        ));
+        )
     }
-    if !response.tool_calls.is_empty() {
-        chunks.push(chunk(
-            &id,
-            created,
-            &model,
+
+    pub fn text(&self, text: String) -> ChatCompletionChunk {
+        self.chunk(
             AssistantDelta {
-                tool_calls: tool_calls(response.tool_calls)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, call)| ChunkToolCall {
-                        index,
-                        id: call.id,
-                        kind: call.kind,
-                        function: call.function,
-                    })
-                    .collect(),
+                content: Some(text),
                 ..Default::default()
             },
             None,
             None,
-        ));
+        )
     }
-    chunks.push(chunk(
-        &id,
-        created,
-        &model,
-        AssistantDelta::default(),
-        Some(response.finish_reason),
-        Some(usage(response.input_tokens, response.output_tokens)),
-    ));
-    chunks
+
+    pub fn completed(
+        &self,
+        input_tokens: usize,
+        output_tokens: usize,
+        calls: Vec<ToolCall>,
+        finish_reason: FinishReason,
+    ) -> Vec<ChatCompletionChunk> {
+        let mut chunks = Vec::new();
+        if !calls.is_empty() {
+            chunks.push(
+                self.chunk(
+                    AssistantDelta {
+                        tool_calls: tool_calls(calls)
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, call)| ChunkToolCall {
+                                index,
+                                id: call.id,
+                                kind: call.kind,
+                                function: call.function,
+                            })
+                            .collect(),
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                ),
+            );
+        }
+        chunks.push(self.chunk(
+            AssistantDelta::default(),
+            Some(finish_reason),
+            Some(usage(input_tokens, output_tokens)),
+        ));
+        chunks
+    }
+
+    fn chunk(
+        &self,
+        delta: AssistantDelta,
+        finish_reason: Option<FinishReason>,
+        usage: Option<CompletionUsage>,
+    ) -> ChatCompletionChunk {
+        chunk(
+            &self.id,
+            self.created,
+            &self.model,
+            delta,
+            finish_reason,
+            usage,
+        )
+    }
 }
 
 fn chunk(

@@ -1,6 +1,7 @@
 use super::{CausalModelBackend, ModelProvider};
 use crate::{
     descriptor::ModelDescriptor,
+    execution::{ExecutionTarget, ModelPrecision},
     tool_calls::{QwenToolCallParser, ToolCallParser},
 };
 use anyhow::{Context, Result};
@@ -17,6 +18,17 @@ impl ModelProvider for Qwen2Provider {
     }
     fn tool_call_parser(&self) -> &'static dyn ToolCallParser {
         &QwenToolCallParser
+    }
+
+    fn supported_runtime_precisions(&self, target: ExecutionTarget) -> &'static [ModelPrecision] {
+        match target {
+            // Candle CPU matmul cannot execute the source BF16 format.
+            ExecutionTarget::Cpu => &[ModelPrecision::F32],
+            // F16 is the conservative Metal path for BF16 checkpoints; model
+            // loading converts weights when constructing the VarBuilder.
+            ExecutionTarget::Metal => &[ModelPrecision::F16, ModelPrecision::F32],
+            ExecutionTarget::Cuda => &[ModelPrecision::F16, ModelPrecision::F32],
+        }
     }
 
     fn load(
