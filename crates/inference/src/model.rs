@@ -10,7 +10,9 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use candle_core::{Device, Tensor};
 use candle_transformers::generation::LogitsProcessor;
-use protocol::{Acceleration, ChatMessage, HardwareInfo, ModelFile, ModelManifest, ToolDefinition};
+use decompute_core::{
+    Acceleration, ChatMessage, ChatRole, HardwareInfo, ModelFile, ModelManifest, ToolDefinition,
+};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -71,7 +73,7 @@ impl LocalModel {
     pub fn smoke_test(&mut self) -> Result<()> {
         self.generate(
             &[ChatMessage {
-                role: protocol::ChatRole::User,
+                role: ChatRole::User,
                 content: "ping".into(),
                 tool_calls: vec![],
                 tool_call_id: None,

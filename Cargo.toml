@@ -1,5 +1,8 @@
 [workspace]
 members = [
+    "crates/decompute-core",
+    "crates/decompute-llama",
+    "crates/decompute-sdk",
     "crates/protocol",
     "crates/inference",
     "crates/inference-example",
@@ -23,6 +26,7 @@ candle-nn = "0.9"
 candle-transformers = "0.9"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
+llama-cpp-2 = { version = "0.1.154", default-features = false }
 minijinja = { version = "2", features = ["json"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }

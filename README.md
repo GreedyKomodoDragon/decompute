@@ -19,6 +19,27 @@ The coordinator only understands HTTP and the shared protocol. Candle, tokenizat
 | `coordinator` | Inference-library-free Axum service. It exposes an OpenAI Chat Completions-compatible API, stores worker records, expires stale heartbeats, selects the least-busy eligible worker with an exact model match, and proxies private inference requests. |
 | `client` | Small CLI client for the coordinator's OpenAI-compatible endpoint. `curl` or OpenCode are the preferred API clients. |
 
+## In-process SDK foundations
+
+The workspace now separates reusable local-inference concerns from network transport:
+
+| Crate | Responsibility |
+| --- | --- |
+| `decompute-core` | Transport-neutral chat, tool-call, model-manifest, and hardware types. |
+| `decompute-sdk` | Public async-facing `LocalModelHandle`, backed by a dedicated model thread; supports complete and progressive generation without an HTTP server. |
+| `decompute-llama` | Opt-in GGUF/llama.cpp integration point. Its `runtime` feature reads GGUF metadata; `metal` enables llama.cpp's Metal backend. |
+
+`protocol` re-exports the domain types from `decompute-core` for source compatibility, but continues to own HTTP worker/coordinator payloads and lifecycle state. The existing Candle/safetensors `inference` crate now depends only on `decompute-core`, never on protocol.
+
+The llama.cpp binding compiles native C++ code. On this Mac, build it with Homebrew LLVM rather than the incomplete Command Line Tools C++ driver:
+
+```bash
+CXX="$(brew --prefix llvm)/bin/clang++" \
+  cargo check -p decompute-llama --features runtime
+```
+
+Add `metal` to that feature list after the GGUF runtime loader is extended into the worker. The existing Candle worker remains the current operational backend; embeddings, reranking, vision, audio transcription, GBNF generation, and a llama.cpp-backed worker are planned runtime additions rather than claimed capabilities today.
+
 The process boundary is deliberate: moving a worker to another machine only changes its bind/advertise address; neither the coordinator nor protocol needs to know how the model is executed.
 
 ## Prerequisites

@@ -1,0 +1,14 @@
+[package]
+name = "decompute-llama"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+runtime = ["dep:llama-cpp-2"]
+metal = ["runtime", "llama-cpp-2/metal"]
+
+[dependencies]
+anyhow.workspace = true
+decompute-core = { path = "../decompute-core" }
+llama-cpp-2 = { workspace = true, optional = true }

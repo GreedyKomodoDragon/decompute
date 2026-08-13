@@ -7,5 +7,6 @@ pub mod provider;
 pub mod tokenizer;
 pub mod tool_calls;
 
+pub use decompute_core::*;
 pub use generation::*;
 pub use model::*;

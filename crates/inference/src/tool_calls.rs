@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use protocol::{FinishReason, FunctionCall, ToolCall, ToolDefinition, ToolType};
+use decompute_core::{FinishReason, FunctionCall, ToolCall, ToolDefinition, ToolType};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -185,7 +185,7 @@ fn marker_prefix_suffix_len(value: &str, marker: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::FunctionDefinition;
+    use decompute_core::FunctionDefinition;
 
     fn tools() -> Vec<ToolDefinition> {
         vec![ToolDefinition {

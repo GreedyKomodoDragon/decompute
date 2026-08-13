@@ -1,11 +1,11 @@
 [package]
-name = "protocol"
+name = "decompute-sdk"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 decompute-core = { path = "../decompute-core" }
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
+inference = { path = "../inference" }
+tokio.workspace = true
 uuid.workspace = true

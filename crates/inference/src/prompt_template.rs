@@ -1,7 +1,7 @@
 use crate::descriptor::ModelDescriptor;
 use anyhow::{Context, Result, bail};
+use decompute_core::{ChatMessage, ToolDefinition};
 use minijinja::{AutoEscape, Environment, UndefinedBehavior, context};
-use protocol::{ChatMessage, ToolDefinition};
 use serde::Deserialize;
 use std::{collections::BTreeMap, fs};
 
@@ -120,7 +120,7 @@ fn template_names(templates: &BTreeMap<String, String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::ChatRole;
+    use decompute_core::{ChatRole, FunctionDefinition, ToolType};
     use std::path::PathBuf;
 
     fn descriptor(directory: &std::path::Path) -> ModelDescriptor {
@@ -219,8 +219,8 @@ mod tests {
         )
         .unwrap();
         let tools = vec![ToolDefinition {
-            kind: protocol::ToolType::Function,
-            function: protocol::FunctionDefinition {
+            kind: ToolType::Function,
+            function: FunctionDefinition {
                 name: "get_time".into(),
                 description: None,
                 parameters: serde_json::json!({"type":"object"}),

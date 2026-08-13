@@ -18,8 +18,9 @@ pub struct GenerationResult {
     pub text: String,
     pub input_tokens: usize,
     pub output_tokens: usize,
-    pub tool_calls: Vec<protocol::ToolCall>,
-    pub finish_reason: protocol::FinishReason,
+    pub tool_calls: Vec<ToolCall>,
+    pub finish_reason: FinishReason,
 }
 
 pub type TokenCallback<'a> = dyn FnMut(&str) -> anyhow::Result<()> + Send + 'a;
+use decompute_core::{FinishReason, ToolCall};
