@@ -3,9 +3,15 @@ name = "decompute-sdk"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+llama = ["dep:decompute-llama"]
+llama-metal = ["llama", "decompute-llama/metal"]
+
 [dependencies]
 anyhow.workspace = true
 decompute-core = { path = "../decompute-core" }
+decompute-llama = { path = "../decompute-llama", optional = true, features = ["runtime"] }
 inference = { path = "../inference" }
 tokio.workspace = true
 uuid.workspace = true

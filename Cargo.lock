@@ -701,6 +701,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "decompute-core",
+ "encoding_rs",
  "llama-cpp-2",
 ]
 
@@ -710,6 +711,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "decompute-core",
+ "decompute-llama",
  "inference",
  "tokio",
  "uuid",

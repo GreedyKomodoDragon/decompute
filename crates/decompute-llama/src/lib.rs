@@ -7,9 +7,15 @@ use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "runtime")]
+mod runtime;
+
+#[cfg(feature = "runtime")]
 use anyhow::Context;
 #[cfg(feature = "runtime")]
 use llama_cpp_2::gguf::GgufContext;
+
+#[cfg(feature = "runtime")]
+pub use runtime::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GgufModelInfo {

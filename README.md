@@ -26,8 +26,8 @@ The workspace now separates reusable local-inference concerns from network trans
 | Crate | Responsibility |
 | --- | --- |
 | `decompute-core` | Transport-neutral chat, tool-call, model-manifest, and hardware types. |
-| `decompute-sdk` | Public async-facing `LocalModelHandle`, backed by a dedicated model thread; supports complete and progressive generation without an HTTP server. |
-| `decompute-llama` | Opt-in GGUF/llama.cpp integration point. Its `runtime` feature reads GGUF metadata; `metal` enables llama.cpp's Metal backend. |
+| `decompute-sdk` | Public async-facing Candle and optional GGUF model handles, each backed by a dedicated model thread and progressive generation events. |
+| `decompute-llama` | Opt-in GGUF/llama.cpp runtime: metadata inspection, model loading, embedded-template rendering, token generation, and optional Metal compilation. |
 
 `protocol` re-exports the domain types from `decompute-core` for source compatibility, but continues to own HTTP worker/coordinator payloads and lifecycle state. The existing Candle/safetensors `inference` crate now depends only on `decompute-core`, never on protocol.
 
@@ -35,10 +35,10 @@ The llama.cpp binding compiles native C++ code. On this Mac, build it with Homeb
 
 ```bash
 CXX="$(brew --prefix llvm)/bin/clang++" \
-  cargo check -p decompute-llama --features runtime
+  cargo check -p decompute-sdk --features llama
 ```
 
-Add `metal` to that feature list after the GGUF runtime loader is extended into the worker. The existing Candle worker remains the current operational backend; embeddings, reranking, vision, audio transcription, GBNF generation, and a llama.cpp-backed worker are planned runtime additions rather than claimed capabilities today.
+Use `llama-metal` instead of `llama` to compile llama.cpp with Metal support, then set `GgufLoadConfig::gpu_layers` when loading a model. The existing Candle worker remains the current operational backend; tool parsing for GGUF, embeddings, reranking, vision, audio transcription, GBNF generation, and worker migration are planned runtime additions rather than claimed capabilities today.
 
 The process boundary is deliberate: moving a worker to another machine only changes its bind/advertise address; neither the coordinator nor protocol needs to know how the model is executed.
 
