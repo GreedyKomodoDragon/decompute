@@ -12,6 +12,5 @@ llama-metal = ["llama", "decompute-llama/metal"]
 anyhow.workspace = true
 decompute-core = { path = "../decompute-core" }
 decompute-llama = { path = "../decompute-llama", optional = true, features = ["runtime"] }
-inference = { path = "../inference" }
 tokio.workspace = true
 uuid.workspace = true

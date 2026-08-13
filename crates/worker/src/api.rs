@@ -1,4 +1,4 @@
-use crate::state::{InferenceJob, WorkerRuntime};
+use crate::state::WorkerRuntime;
 use axum::{
     Json, Router,
     extract::State,
@@ -54,34 +54,15 @@ async fn generate(
     if let Err(message) = state.try_reserve(&request.model) {
         return error(StatusCode::SERVICE_UNAVAILABLE, message).into_response();
     }
-    let (tx, rx) = oneshot::channel();
     info!(request_id = %request.request_id, model = %request.model, "accepted inference request");
-    if let Err(message) = state
-        .submit(InferenceJob::Generate {
-            request,
-            response: tx,
-        })
-        .await
-    {
-        state.release();
-        return error(StatusCode::SERVICE_UNAVAILABLE, message).into_response();
-    }
-    let result = rx.await;
+    let result = state.generate(request).await;
     state.release();
     match result {
-        Ok(Ok(mut response)) => {
-            response.worker_id = state.node_id.clone();
-            Json(response).into_response()
-        }
-        Ok(Err(err)) => {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => {
             tracing::error!(error = %format!("{err:#}"), "inference failed");
             error(StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")).into_response()
         }
-        Err(_) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "inference response dropped",
-        )
-        .into_response(),
     }
 }
 async fn stream(
@@ -97,17 +78,11 @@ async fn stream(
     let (tx, rx) = mpsc::channel::<GenerationStreamEvent>(32);
     let (finished_tx, finished_rx) = oneshot::channel();
     info!(request_id = %request.request_id, model = %request.model, "accepted streamed inference request");
-    if let Err(message) = state
-        .submit(InferenceJob::Stream {
-            request,
-            events: tx,
-            finished: finished_tx,
-        })
-        .await
-    {
-        state.release();
-        return error(StatusCode::SERVICE_UNAVAILABLE, message).into_response();
-    }
+    let worker = state.clone();
+    tokio::spawn(async move {
+        worker.stream(request, tx).await;
+        let _ = finished_tx.send(());
+    });
     let release = state.clone();
     let stream = ReceiverStream::new(rx)
         .map(move |event| {

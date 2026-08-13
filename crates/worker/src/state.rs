@@ -1,26 +1,11 @@
 use anyhow::Result;
-use inference::{GenerationConfig, LocalModel};
+use decompute_sdk::{ChatRequest, GenerationConfig, GenerationEvent, GgufModelHandle};
 use protocol::{
     Acceleration, GenerateRequest, GenerateResponse, GenerationStreamEvent, ModelCapability,
     ModelManifest, ModelStatus, WorkerCapabilities, WorkerState,
 };
-use std::{
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    thread,
-};
-use tokio::sync::{mpsc, oneshot};
-
-pub enum InferenceJob {
-    Generate {
-        request: GenerateRequest,
-        response: oneshot::Sender<Result<GenerateResponse>>,
-    },
-    Stream {
-        request: GenerateRequest,
-        events: mpsc::Sender<GenerationStreamEvent>,
-        finished: oneshot::Sender<()>,
-    },
-}
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tokio::sync::mpsc;
 
 pub struct WorkerRuntime {
     pub node_id: String,
@@ -30,7 +15,7 @@ pub struct WorkerRuntime {
     pub manifest: ModelManifest,
     active: AtomicUsize,
     draining: AtomicBool,
-    jobs: mpsc::Sender<InferenceJob>,
+    model: GgufModelHandle,
     acceleration: Acceleration,
 }
 
@@ -42,10 +27,9 @@ impl WorkerRuntime {
         max_requests: usize,
         manifest: ModelManifest,
         acceleration: Acceleration,
-        mut model: LocalModel,
+        model: GgufModelHandle,
     ) -> Self {
-        let (jobs, mut receiver) = mpsc::channel(max_requests.max(1));
-        let runtime = Self {
+        Self {
             node_id,
             model_id,
             address,
@@ -53,112 +37,9 @@ impl WorkerRuntime {
             manifest,
             active: AtomicUsize::new(0),
             draining: AtomicBool::new(false),
-            jobs,
+            model,
             acceleration,
-        };
-        thread::Builder::new()
-            .name("local-inference".into())
-            .spawn(move || {
-                while let Some(job) = receiver.blocking_recv() {
-                    match job {
-                        InferenceJob::Generate { request, response } => {
-                            tracing::info!(request_id = %request.request_id, model = %request.model, "inference thread started request");
-                            let result = request
-                                .normalized_messages()
-                                .map_err(anyhow::Error::msg)
-                                .and_then(|messages| {
-                                    model.generate(
-                                        &messages,
-                                        request.template.as_deref(),
-                                        &request.tools,
-                                        request.request_id,
-                                        GenerationConfig {
-                                            max_tokens: request.max_tokens,
-                                            temperature: None,
-                                        },
-                                    )
-                                })
-                                .map(|generated| GenerateResponse {
-                                    request_id: request.request_id,
-                                    worker_id: String::new(),
-                                    model: request.model,
-                                    text: generated.text,
-                                    input_tokens: generated.input_tokens,
-                                    output_tokens: generated.output_tokens,
-                                    tool_calls: generated.tool_calls,
-                                    finish_reason: generated.finish_reason,
-                                });
-                            let _ = response.send(result);
-                        }
-                        InferenceJob::Stream {
-                            request,
-                            events,
-                            finished,
-                        } => {
-                            tracing::info!(request_id = %request.request_id, model = %request.model, "inference thread started streamed request");
-                            let messages = match request.normalized_messages() {
-                                Ok(messages) => messages,
-                                Err(err) => {
-                                    tracing::error!(error = %format!("{err:#}"), "streamed inference failed");
-                                    let _ = events.blocking_send(GenerationStreamEvent::Error {
-                                        message: format!("{err:#}"),
-                                    });
-                                    let _ = finished.send(());
-                                    continue;
-                                }
-                            };
-                            let mut callback = |token: &str| {
-                                events
-                                    .blocking_send(GenerationStreamEvent::TextDelta {
-                                        text: token.to_owned(),
-                                    })
-                                    .map_err(|_| anyhow::anyhow!("stream client disconnected"))
-                            };
-                            match model.generate_with_callback(
-                                &messages,
-                                request.template.as_deref(),
-                                &request.tools,
-                                request.request_id,
-                                GenerationConfig {
-                                    max_tokens: request.max_tokens,
-                                    temperature: None,
-                                },
-                                &mut callback,
-                            ) {
-                                Ok(generated) => {
-                                    tracing::info!(
-                                        request_id = %request.request_id,
-                                        output_tokens = generated.output_tokens,
-                                        tool_calls = generated.tool_calls.len(),
-                                        finish_reason = ?generated.finish_reason,
-                                        "inference thread completed streamed request"
-                                    );
-                                    let _ =
-                                        events.blocking_send(GenerationStreamEvent::Completed {
-                                            input_tokens: generated.input_tokens,
-                                            output_tokens: generated.output_tokens,
-                                            tool_calls: generated.tool_calls,
-                                            finish_reason: generated.finish_reason,
-                                        });
-                                }
-                                Err(err) => {
-                                    tracing::error!(
-                                        request_id = %request.request_id,
-                                        error = %format!("{err:#}"),
-                                        "inference thread failed streamed request"
-                                    );
-                                    let _ = events.blocking_send(GenerationStreamEvent::Error {
-                                        message: format!("{err:#}"),
-                                    });
-                                }
-                            }
-                            let _ = finished.send(());
-                        }
-                    }
-                }
-            })
-            .expect("start inference thread");
-        runtime
+        }
     }
 
     pub fn capabilities(&self) -> WorkerCapabilities {
@@ -216,10 +97,82 @@ impl WorkerRuntime {
     pub fn release(&self) {
         self.active.fetch_sub(1, Ordering::AcqRel);
     }
-    pub async fn submit(&self, job: InferenceJob) -> Result<(), &'static str> {
-        self.jobs
-            .send(job)
-            .await
-            .map_err(|_| "inference worker stopped")
+    pub async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse> {
+        tracing::info!(request_id = %request.request_id, model = %request.model, "starting local inference request");
+        let generated = self.model.generate(Self::chat_request(&request)?).await?;
+        Ok(GenerateResponse {
+            request_id: request.request_id,
+            worker_id: self.node_id.clone(),
+            model: request.model,
+            text: generated.text,
+            input_tokens: generated.input_tokens,
+            output_tokens: generated.output_tokens,
+            tool_calls: generated.tool_calls,
+            finish_reason: generated.finish_reason,
+        })
+    }
+
+    pub async fn stream(
+        &self,
+        request: GenerateRequest,
+        events: mpsc::Sender<GenerationStreamEvent>,
+    ) {
+        tracing::info!(request_id = %request.request_id, model = %request.model, "starting streamed local inference request");
+        let request_id = request.request_id;
+        let chat_request = match Self::chat_request(&request) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = events
+                    .send(GenerationStreamEvent::Error {
+                        message: format!("{error:#}"),
+                    })
+                    .await;
+                return;
+            }
+        };
+        let mut receiver = match self.model.stream(chat_request).await {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                let _ = events
+                    .send(GenerationStreamEvent::Error {
+                        message: format!("{error:#}"),
+                    })
+                    .await;
+                return;
+            }
+        };
+        while let Some(event) = receiver.recv().await {
+            let event = match event {
+                GenerationEvent::TextDelta(text) => GenerationStreamEvent::TextDelta { text },
+                GenerationEvent::Completed(result) => {
+                    tracing::info!(request_id = %request_id, output_tokens = result.output_tokens, "completed streamed local inference request");
+                    GenerationStreamEvent::Completed {
+                        input_tokens: result.input_tokens,
+                        output_tokens: result.output_tokens,
+                        tool_calls: result.tool_calls,
+                        finish_reason: result.finish_reason,
+                    }
+                }
+                GenerationEvent::Error(error) => GenerationStreamEvent::Error {
+                    message: format!("{error:#}"),
+                },
+            };
+            if events.send(event).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    fn chat_request(request: &GenerateRequest) -> Result<ChatRequest> {
+        Ok(ChatRequest {
+            request_id: request.request_id,
+            messages: request.normalized_messages().map_err(anyhow::Error::msg)?,
+            template: request.template.clone(),
+            tools: request.tools.clone(),
+            generation: GenerationConfig {
+                max_tokens: request.max_tokens,
+                temperature: None,
+            },
+        })
     }
 }

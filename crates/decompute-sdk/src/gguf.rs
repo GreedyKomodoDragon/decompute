@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use decompute_core::FinishReason;
+use decompute_core::{ChatMessage, ChatRole, FinishReason};
 use decompute_llama::{GgufGenerationConfig, GgufModel};
 use std::{path::Path, thread};
 use tokio::sync::{mpsc, oneshot};
@@ -86,6 +86,28 @@ impl GgufModelHandle {
             .await
             .map_err(|_| anyhow::anyhow!("GGUF model execution thread stopped"))?;
         Ok(receiver)
+    }
+
+    /// Runs a minimal generation to verify that the selected runtime can
+    /// execute the loaded model. Workers use this before advertising a model.
+    pub async fn smoke_test(&self) -> Result<()> {
+        self.generate(ChatRequest {
+            request_id: uuid::Uuid::nil(),
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "Reply with one word.".into(),
+                tool_calls: vec![],
+                tool_call_id: None,
+            }],
+            template: None,
+            tools: vec![],
+            generation: crate::GenerationConfig {
+                max_tokens: 1,
+                temperature: None,
+            },
+        })
+        .await
+        .map(|_| ())
     }
 }
 

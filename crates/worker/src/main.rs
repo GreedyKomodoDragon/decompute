@@ -6,7 +6,7 @@ mod state;
 use anyhow::Result;
 use axum::Router;
 use clap::Parser;
-use inference::LocalModel;
+use decompute_sdk::{GgufLoadConfig, GgufModelHandle};
 use protocol::Acceleration;
 use state::WorkerRuntime;
 use std::{net::SocketAddr, sync::Arc};
@@ -43,53 +43,64 @@ enum DeviceChoice {
     Metal,
 }
 
-fn load_model(args: &Args) -> Result<(LocalModel, Acceleration)> {
+async fn load_model(args: &Args) -> Result<(GgufModelHandle, Acceleration)> {
     match args.device {
         DeviceChoice::Cpu => {
-            load_and_verify(&args.model, candle_core::Device::Cpu, Acceleration::Cpu)
+            load_and_verify(&args.model, GgufLoadConfig::default(), Acceleration::Cpu).await
         }
-        DeviceChoice::Metal => load_metal(&args.model),
+        DeviceChoice::Metal => load_metal(&args.model).await,
         DeviceChoice::Auto => {
             #[cfg(feature = "metal")]
-            if let Ok(device) = candle_core::Device::new_metal(0) {
-                match load_and_verify(&args.model, device, Acceleration::Metal) {
+            {
+                match load_and_verify(
+                    &args.model,
+                    GgufLoadConfig {
+                        gpu_layers: Some(u32::MAX),
+                        ..Default::default()
+                    },
+                    Acceleration::Metal,
+                )
+                .await
+                {
                     Ok(model) => return Ok(model),
                     Err(err) => {
                         tracing::warn!(error = %format!("{err:#}"), "Metal model probe failed; falling back to CPU")
                     }
                 }
             }
-            load_and_verify(&args.model, candle_core::Device::Cpu, Acceleration::Cpu)
+            load_and_verify(&args.model, GgufLoadConfig::default(), Acceleration::Cpu).await
         }
     }
 }
 
-fn load_and_verify(
+async fn load_and_verify(
     path: &str,
-    device: candle_core::Device,
+    config: GgufLoadConfig,
     acceleration: Acceleration,
-) -> Result<(LocalModel, Acceleration)> {
-    let mut model = LocalModel::load_on_device(path, device)?;
+) -> Result<(GgufModelHandle, Acceleration)> {
+    let model = GgufModelHandle::load(path, config)?;
     info!(
-        target = %model.execution_plan().target,
-        stored_precision = %model.execution_plan().stored_precision,
-        runtime_precision = %model.execution_plan().runtime_precision,
-        "selected model execution plan"
+        target = ?acceleration,
+        "loaded GGUF llama.cpp execution plan"
     );
-    model.smoke_test()?;
+    model.smoke_test().await?;
     Ok((model, acceleration))
 }
 
 #[cfg(feature = "metal")]
-fn load_metal(path: &str) -> Result<(LocalModel, Acceleration)> {
+async fn load_metal(path: &str) -> Result<(GgufModelHandle, Acceleration)> {
     load_and_verify(
         path,
-        candle_core::Device::new_metal(0)?,
+        GgufLoadConfig {
+            gpu_layers: Some(u32::MAX),
+            ..Default::default()
+        },
         Acceleration::Metal,
     )
+    .await
 }
 #[cfg(not(feature = "metal"))]
-fn load_metal(_path: &str) -> Result<(LocalModel, Acceleration)> {
+async fn load_metal(_path: &str) -> Result<(GgufModelHandle, Acceleration)> {
     anyhow::bail!("Metal support was not compiled; run with --features metal")
 }
 
@@ -102,8 +113,8 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| format!("http://{}:{}", args.bind, args.port));
     info!(model = %args.model, "loading local model");
-    let manifest = inference::local_manifest(&args.model)?;
-    let (model, acceleration) = load_model(&args)?;
+    let manifest = decompute_llama::local_manifest(&args.model)?;
+    let (model, acceleration) = load_model(&args).await?;
     let runtime = Arc::new(WorkerRuntime::new(
         args.node_id,
         args.model_id,

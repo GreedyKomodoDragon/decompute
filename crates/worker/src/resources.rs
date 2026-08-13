@@ -1,5 +1,5 @@
 use protocol::{Acceleration, HardwareInfo};
 
 pub fn detect(acceleration: Acceleration) -> HardwareInfo {
-    inference::hardware_info(acceleration)
+    decompute_llama::hardware_info(acceleration)
 }

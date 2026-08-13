@@ -1,4 +1,24 @@
-use decompute_core::{FinishReason, ToolCall};
+use anyhow::Error;
+use decompute_core::{ChatMessage, FinishReason, ToolCall, ToolDefinition};
+use uuid::Uuid;
+
+#[derive(Clone, Debug)]
+pub struct ChatRequest {
+    pub request_id: Uuid,
+    pub messages: Vec<ChatMessage>,
+    /// Reserved for a future named-template registry. GGUF models currently
+    /// use the template embedded in their own metadata.
+    pub template: Option<String>,
+    pub tools: Vec<ToolDefinition>,
+    pub generation: GenerationConfig,
+}
+
+#[derive(Debug)]
+pub enum GenerationEvent {
+    TextDelta(String),
+    Completed(GenerationResult),
+    Error(Error),
+}
 
 #[derive(Clone, Debug)]
 pub struct GenerationConfig {
@@ -22,25 +42,4 @@ pub struct GenerationResult {
     pub output_tokens: usize,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: FinishReason,
-}
-
-impl From<inference::GenerationResult> for GenerationResult {
-    fn from(value: inference::GenerationResult) -> Self {
-        Self {
-            text: value.text,
-            input_tokens: value.input_tokens,
-            output_tokens: value.output_tokens,
-            tool_calls: value.tool_calls,
-            finish_reason: value.finish_reason,
-        }
-    }
-}
-
-impl From<GenerationConfig> for inference::GenerationConfig {
-    fn from(value: GenerationConfig) -> Self {
-        Self {
-            max_tokens: value.max_tokens,
-            temperature: value.temperature,
-        }
-    }
 }
