@@ -18,6 +18,9 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<usize>,
     #[serde(default)]
     pub max_completion_tokens: Option<usize>,
+    /// Optional Decompute extension selecting a local named GGUF template.
+    #[serde(default)]
+    pub template: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,7 +88,7 @@ impl TryFrom<ChatCompletionRequest> for GenerateRequest {
             model: request.model,
             prompt: None,
             messages: Some(messages),
-            template: None,
+            template: request.template,
             tools: request.tools,
             max_tokens: request
                 .max_completion_tokens

@@ -37,7 +37,7 @@ CXX="$(brew --prefix llvm)/bin/clang++" \
   cargo check -p decompute-sdk --features llama
 ```
 
-Use `llama-metal` instead of `llama` to compile llama.cpp with Metal support. The worker selects it with `--device metal` or probes it with `--device auto`. Tool-call parsing for GGUF, embeddings, reranking, vision, audio transcription, and GBNF generation are future runtime additions.
+Use `llama-metal` instead of `llama` to compile llama.cpp with Metal support. The worker selects it with `--device metal` or probes it with `--device auto`. Qwen GGUF tool calls are supported; embeddings, reranking, vision, audio transcription, and GBNF generation remain future runtime additions.
 
 The process boundary is deliberate: moving a worker to another machine only changes its bind/advertise address; neither the coordinator nor protocol needs to know how the model is executed.
 
@@ -111,11 +111,11 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 At model load, llama.cpp reads the chat template embedded in the GGUF and applies it to normalized messages with a generation prompt. This avoids a hard-coded Qwen prompt wrapper and makes the worker portable across GGUF models that package their own template.
 
-For safety, templates have no filesystem loader or host callbacks. Multimodal message content is intentionally unsupported.
+For safety, templates are loaded only once from the model-local override directory; they have no arbitrary filesystem loader or host callbacks. Multimodal message content is intentionally unsupported.
 
 ### Tool-call proposals
 
-The HTTP API accepts OpenAI-style tool definitions and tool-history messages so it can remain a compatible model-provider boundary. GGUF tool-call rendering and parsing are not implemented yet, so use no-tools mode with Qwen for now. Neither component executes a tool.
+The HTTP API accepts OpenAI-style tool definitions and tool-history messages. For Qwen GGUF models, the worker selects its built-in Qwen tool template, renders the supplied schemas, parses `<tool_call>` JSON blocks, and returns standard OpenAI tool calls. Neither component executes a tool.
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -139,7 +139,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-Tool calls will later be model-template-specific: the embedded GGUF template needs to render tool definitions, and the runtime needs a matching parser for the model's generated call format. The client will continue to own tool execution.
+The client owns the execution loop: validate and execute each proposed call in its own trusted environment, then submit an assistant tool-call message and one `tool` message per result. The worker renders the tool history back into Qwen's expected format. For another model family, add a model-aware template and parser without changing the coordinator protocol.
 
 ### OpenCode
 
@@ -166,7 +166,29 @@ The sample declares a 2,048-token context window and 96-token output limit. Thos
 
 ### Models and templates
 
-GGUF metadata selects both the model architecture and its default chat template. Adding a GGUF-compatible model normally only requires pointing a worker at another `.gguf` file; no coordinator or protocol change is needed. Named template overrides are reserved for a future template registry.
+GGUF metadata selects both the model architecture and its embedded default chat template. Adding a GGUF-compatible model normally only requires pointing a worker at another `.gguf` file; no coordinator or protocol change is needed.
+
+For model-specific experimentation, add named MiniJinja overrides beside the model:
+
+```text
+models/
+└── Qwen2.5-0.5B-Instruct-Q4_K_M.gguf.templates/
+    ├── rag.jinja
+    └── partials/
+        └── context.jinja
+```
+
+Top-level `*.jinja` files are selectable by filename without the extension. They may `include` or `import` files under subdirectories. Select one through Decompute's optional `template` request field:
+
+```json
+{
+  "model": "tiny-model",
+  "template": "rag",
+  "messages": [{"role": "user", "content": "Summarize this context."}]
+}
+```
+
+Templates are loaded once at worker startup from this model-local directory; they cannot load arbitrary host files. With no explicit override, the GGUF embedded template remains the default. Qwen tool requests automatically select the built-in `qwen-tools` template.
 
 For streaming, add `"stream": true` to `POST /v1/chat/completions`. Visible text is forwarded from the worker through the coordinator as it is generated, using OpenAI-style Server-Sent Events and a final `data: [DONE]`. Qwen tool-call markup is withheld until generation completes, then emitted as structured OpenAI tool-call chunks.
 

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use decompute_core::{ChatMessage, ChatRole};
+use decompute_core::{ChatMessage, ChatRole, FinishReason, ToolCall, ToolDefinition};
 use encoding_rs::UTF_8;
 use llama_cpp_2::{
     context::params::LlamaContextParams,
@@ -13,6 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
+use uuid::Uuid;
 
 static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
 static BACKEND_INIT: Mutex<()> = Mutex::new(());
@@ -49,11 +50,13 @@ impl Default for GgufGenerationConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GgufGenerationResult {
     pub text: String,
     pub input_tokens: usize,
     pub output_tokens: usize,
+    pub tool_calls: Vec<ToolCall>,
+    pub finish_reason: FinishReason,
 }
 
 /// A loaded GGUF text model. The SDK owns it on a dedicated thread so this
@@ -62,6 +65,8 @@ pub struct GgufModel {
     model: LlamaModel,
     path: PathBuf,
     context_tokens: u32,
+    templates: super::TemplateRegistry,
+    qwen_tool_calls: bool,
 }
 
 impl GgufModel {
@@ -71,6 +76,7 @@ impl GgufModel {
         }
         let path = path.as_ref();
         super::validate_source(path)?;
+        let info = super::inspect(path)?;
         let mut parameters = LlamaModelParams::default();
         if let Some(layers) = config.gpu_layers {
             parameters = parameters.with_n_gpu_layers(layers);
@@ -81,6 +87,8 @@ impl GgufModel {
             model,
             path: path.to_path_buf(),
             context_tokens: config.context_tokens,
+            templates: super::TemplateRegistry::load(path, &info.architecture)?,
+            qwen_tool_calls: info.architecture.to_ascii_lowercase().starts_with("qwen"),
         })
     }
 
@@ -88,8 +96,20 @@ impl GgufModel {
         &self.path
     }
 
-    /// Uses the template embedded in the GGUF rather than a hard-coded model family template.
-    pub fn render_chat(&self, messages: &[ChatMessage]) -> Result<String> {
+    /// Uses the GGUF embedded template unless a named override or tool-aware
+    /// template is required.
+    pub fn render_chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        requested_template: Option<&str>,
+    ) -> Result<String> {
+        if let Some(template) = self
+            .templates
+            .select(requested_template, !tools.is_empty())?
+        {
+            return self.templates.render(&template, messages, tools);
+        }
         let template = self
             .model
             .chat_template(None)
@@ -118,11 +138,42 @@ impl GgufModel {
     pub fn generate_chat(
         &mut self,
         messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+        requested_template: Option<&str>,
+        request_id: Uuid,
         config: GgufGenerationConfig,
         callback: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<GgufGenerationResult> {
-        let prompt = self.render_chat(messages)?;
-        self.generate(&prompt, config, callback)
+        if !tools.is_empty() && !self.qwen_tool_calls {
+            bail!("tool-call parsing is currently implemented for Qwen GGUF models only");
+        }
+        let prompt = self.render_chat(messages, tools, requested_template)?;
+        // Tool markup is only parsed after completion, so it must not leak as
+        // visible OpenAI text in streamed responses.
+        let mut deferred = String::new();
+        let mut capture = |piece: &str| {
+            if tools.is_empty() {
+                callback(piece)
+            } else {
+                deferred.push_str(piece);
+                Ok(())
+            }
+        };
+        let mut generated = self.generate(&prompt, config, &mut capture)?;
+        if !tools.is_empty() {
+            let (text, tool_calls) = super::parse_tool_calls(&deferred, tools, request_id)?;
+            if !text.is_empty() {
+                callback(&text)?;
+            }
+            generated.text = text;
+            generated.finish_reason = if tool_calls.is_empty() {
+                FinishReason::Stop
+            } else {
+                FinishReason::ToolCalls
+            };
+            generated.tool_calls = tool_calls;
+        }
+        Ok(generated)
     }
 
     pub fn generate(
@@ -204,6 +255,8 @@ impl GgufModel {
             text: output,
             input_tokens: tokens.len(),
             output_tokens: position - tokens.len(),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
         })
     }
 }

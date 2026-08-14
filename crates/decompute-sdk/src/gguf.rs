@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use decompute_core::{ChatMessage, ChatRole, FinishReason};
+use decompute_core::{ChatMessage, ChatRole};
 use decompute_llama::{GgufGenerationConfig, GgufModel};
 use std::{path::Path, thread};
 use tokio::sync::{mpsc, oneshot};
@@ -118,6 +118,9 @@ fn generate(
 ) -> Result<GenerationResult> {
     let result = model.generate_chat(
         &request.messages,
+        &request.tools,
+        request.template.as_deref(),
+        request.request_id,
         GgufGenerationConfig {
             max_tokens: request.generation.max_tokens,
             temperature: request.generation.temperature.map(|value| value as f32),
@@ -128,7 +131,7 @@ fn generate(
         text: result.text,
         input_tokens: result.input_tokens,
         output_tokens: result.output_tokens,
-        tool_calls: vec![],
-        finish_reason: FinishReason::Stop,
+        tool_calls: result.tool_calls,
+        finish_reason: result.finish_reason,
     })
 }

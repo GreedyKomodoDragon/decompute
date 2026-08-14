@@ -3,7 +3,7 @@
 //! This crate deliberately owns native-runtime details. Networking crates do
 //! not depend on it; the SDK will expose a stable actor API over this layer.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use decompute_core::{Acceleration, HardwareInfo, ModelFile, ModelManifest};
 use sha2::{Digest, Sha256};
 use std::{
@@ -14,14 +14,16 @@ use sysinfo::System;
 
 #[cfg(feature = "runtime")]
 mod runtime;
+mod templates;
+mod tool_calls;
 
-#[cfg(feature = "runtime")]
-use anyhow::Context;
 #[cfg(feature = "runtime")]
 use llama_cpp_2::gguf::GgufContext;
 
 #[cfg(feature = "runtime")]
 pub use runtime::*;
+pub use templates::TemplateRegistry;
+pub use tool_calls::parse_tool_calls;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GgufModelInfo {
