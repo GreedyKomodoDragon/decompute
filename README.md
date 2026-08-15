@@ -17,6 +17,7 @@ The coordinator only understands HTTP and the shared protocol. GGUF model loadin
 | `worker` | Process that owns a complete local model. Its Axum server exposes health, capabilities, generation, SSE streaming, and draining endpoints. The SDK owns blocking llama.cpp inference on a dedicated OS thread, so Tokio remains free for HTTP and heartbeats. |
 | `coordinator` | Inference-library-free Axum service. It exposes an OpenAI Chat Completions-compatible API, stores worker records, expires stale heartbeats, selects the least-busy eligible worker with an exact model match, and proxies private inference requests. |
 | `client` | Small CLI client for the coordinator's OpenAI-compatible endpoint. `curl` or OpenCode are the preferred API clients. |
+| `harness` | Native macOS Apple-Silicon egui chat client. It uses only OpenAI-compatible models/chat-completions/SSE endpoints and has no inference or protocol dependency. |
 
 ## In-process SDK foundations
 
@@ -43,6 +44,7 @@ The process boundary is deliberate: moving a worker to another machine only chan
 
 ## Prerequisites
 
+- Apple Silicon macOS with Metal. This prototype's supported local platform is macOS/Metal only.
 - Rust stable (this workspace was built with Rust 1.94)
 - [just](https://github.com/casey/just), installed with `brew install just`
 - A local GGUF quantization of Qwen2.5 0.5B Instruct (the Q4_K_M file is about 400 MB)
@@ -78,6 +80,12 @@ just worker-a
 just worker-b
 ```
 
+In a fourth terminal, start the native macOS chat harness:
+
+```bash
+just harness
+```
+
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
@@ -85,6 +93,14 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 The public API is OpenAI Chat Completions-compatible: `POST /v1/chat/completions` and `GET /v1/models`. The coordinator selects a worker and proxies a private request; clients never receive worker addresses. Inspect the internal registry with `curl http://127.0.0.1:8000/workers`.
+
+### Native macOS harness
+
+`just harness` starts a small egui desktop client for Apple Silicon macOS. It connects to an external OpenAI-compatible endpoint—by default `http://127.0.0.1:8000`—so its wire protocol is not coupled to Decompute. Use **Connect / refresh models** to discover the model advertised by the coordinator, select it, then chat with progressive SSE output.
+
+The harness sends no hidden system message. Its **System harness** editor is disabled and empty by default; enabling it adds exactly the visible text as the leading `system` message. It never executes tools.
+
+Chats and settings persist locally. The context indicator is intentionally only an estimate (characters divided by four), because a generic OpenAI-compatible model listing does not expose tokenizer or context metadata. The harness never silently drops or summarizes history: remove messages or clear a chat yourself when the estimate exceeds the editable context budget. Press **Stop** to abandon a stream; the coordinator then cancels the corresponding worker generation.
 
 By default, the worker recipes use `./models/qwen2.5-0.5b-instruct-q4_k_m.gguf`. Override it for another GGUF model:
 
@@ -159,7 +175,7 @@ Use the model ID returned by `GET /v1/models` if your workers advertise a differ
 
 ### Pi
 
-Pi can use the same OpenAI-compatible coordinator. Merge the `decompute` provider from [`examples/pi-models.json`](examples/pi-models.json) into `~/.pi/agent/models.json`, then make a deliberately small no-tools request while testing CPU inference:
+Pi can use the same OpenAI-compatible coordinator. Merge the `decompute` provider from [`examples/pi-models.json`](examples/pi-models.json) into `~/.pi/agent/models.json`, then make a deliberately small no-tools request while testing the initial model setup:
 
 ```bash
 pi --provider decompute --model tiny-model \
@@ -221,7 +237,7 @@ No transport or protocol changes are needed; this prototype intentionally does n
 
 The worker reads GGUF metadata to identify the model architecture and computes a SHA-256 manifest from the model file. Two workers using the same file therefore advertise the same manifest ID. It runs a one-token smoke test before registering, so a native-backend failure never creates an apparently healthy worker.
 
-Apple Metal is optional and does not alter the network protocol. Build with the feature and explicitly select Metal:
+Apple Metal is the supported local acceleration target and does not alter the network protocol. Build with the feature and explicitly select Metal:
 
 ```bash
 CXX="$(brew --prefix llvm)/bin/clang++" cargo run -p worker --features metal -- \

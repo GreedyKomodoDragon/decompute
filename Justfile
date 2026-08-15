@@ -16,11 +16,11 @@ coordinator:
 
 # Start the first Metal-enabled local worker at http://127.0.0.1:9001.
 worker-a:
-    CC="{{llvm_prefix}}/bin/clang" CXX="{{llvm_prefix}}/bin/clang++" cargo run -p worker --features metal -- --port 9001 --node-id worker-a --coordinator http://127.0.0.1:8000 --model "{{model_path}}"
+    CC="{{llvm_prefix}}/bin/clang" CXX="{{llvm_prefix}}/bin/clang++" cargo run -p worker --features metal -- --device metal --port 9001 --node-id worker-a --coordinator http://127.0.0.1:8000 --model "{{model_path}}"
 
 # Start the second Metal-enabled local worker at http://127.0.0.1:9002.
 worker-b:
-    CC="{{llvm_prefix}}/bin/clang" CXX="{{llvm_prefix}}/bin/clang++" cargo run -p worker --features metal -- --port 9002 --node-id worker-b --coordinator http://127.0.0.1:8000 --model "{{model_path}}"
+    CC="{{llvm_prefix}}/bin/clang" CXX="{{llvm_prefix}}/bin/clang++" cargo run -p worker --features metal -- --device metal --port 9002 --node-id worker-b --coordinator http://127.0.0.1:8000 --model "{{model_path}}"
 
 # Run the full test suite using Homebrew LLVM for llama.cpp's native build.
 test:
@@ -29,3 +29,7 @@ test:
 # Compile the Metal worker without starting services.
 check:
     CC="{{llvm_prefix}}/bin/clang" CXX="{{llvm_prefix}}/bin/clang++" cargo check -p worker --features metal
+
+# Start the native macOS OpenAI-compatible chat harness.
+harness:
+    cargo run -p harness
