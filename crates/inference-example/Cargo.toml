@@ -7,4 +7,5 @@ edition.workspace = true
 anyhow.workspace = true
 decompute-sdk = { path = "../decompute-sdk", features = ["llama"] }
 tokio.workspace = true
+tokio-util.workspace = true
 uuid.workspace = true

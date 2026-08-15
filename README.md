@@ -44,14 +44,14 @@ The process boundary is deliberate: moving a worker to another machine only chan
 ## Prerequisites
 
 - Rust stable (this workspace was built with Rust 1.94)
+- [just](https://github.com/casey/just), installed with `brew install just`
 - A local GGUF quantization of Qwen2.5 0.5B Instruct (the Q4_K_M file is about 400 MB)
 - The Hugging Face CLI, for example: `pipx install huggingface_hub`
 
 Download the model once:
 
 ```bash
-hf download Qwen/Qwen2.5-0.5B-Instruct-GGUF Qwen2.5-0.5B-Instruct-Q4_K_M.gguf \
-  --local-dir ./models
+just download-model
 ```
 
 The downloaded `.gguf` file contains its architecture metadata, tokenizer, and chat template.
@@ -67,15 +67,15 @@ CXX="$(brew --prefix llvm)/bin/clang++" cargo run -p inference-example
 Then use four terminals:
 
 ```bash
-cargo run -p coordinator
+just coordinator
 ```
 
 ```bash
-CXX="$(brew --prefix llvm)/bin/clang++" cargo run -p worker -- --port 9001 --node-id worker-a --coordinator http://127.0.0.1:8000 --model ./models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+just worker-a
 ```
 
 ```bash
-CXX="$(brew --prefix llvm)/bin/clang++" cargo run -p worker -- --port 9002 --node-id worker-b --coordinator http://127.0.0.1:8000 --model ./models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+just worker-b
 ```
 
 ```bash
@@ -85,6 +85,12 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 ```
 
 The public API is OpenAI Chat Completions-compatible: `POST /v1/chat/completions` and `GET /v1/models`. The coordinator selects a worker and proxies a private request; clients never receive worker addresses. Inspect the internal registry with `curl http://127.0.0.1:8000/workers`.
+
+By default, the worker recipes use `./models/qwen2.5-0.5b-instruct-q4_k_m.gguf`. Override it for another GGUF model:
+
+```bash
+MODEL=./models/another-model.gguf just worker-a
+```
 
 ### Chat messages and model templates
 
@@ -172,7 +178,7 @@ For model-specific experimentation, add named MiniJinja overrides beside the mod
 
 ```text
 models/
-└── Qwen2.5-0.5B-Instruct-Q4_K_M.gguf.templates/
+└── qwen2.5-0.5b-instruct-q4_k_m.gguf.templates/
     ├── rag.jinja
     └── partials/
         └── context.jinja
@@ -192,6 +198,8 @@ Templates are loaded once at worker startup from this model-local directory; the
 
 For streaming, add `"stream": true` to `POST /v1/chat/completions`. Visible text is forwarded from the worker through the coordinator as it is generated, using OpenAI-style Server-Sent Events and a final `data: [DONE]`. Qwen tool-call markup is withheld until generation completes, then emitted as structured OpenAI tool-call chunks.
 
+For a model loaded by both accelerated and CPU workers, the coordinator prefers Metal (and future CUDA) workers, then uses active request count and worker ID as deterministic tie-breakers. If the client disconnects, the coordinator sends a private cancellation request to the selected worker; the worker stops at the next safe llama.cpp execution boundary and only then releases its capacity.
+
 Drain a worker without killing an in-flight request:
 
 ```bash
@@ -204,7 +212,7 @@ Run the coordinator on a reachable interface, then run a worker with a reachable
 
 ```bash
 cargo run -p coordinator -- --bind 0.0.0.0
-CXX="$(brew --prefix llvm)/bin/clang++" cargo run -p worker -- --bind 0.0.0.0 --port 9001 --advertise-address http://worker-host:9001 --node-id worker-b --coordinator http://coordinator-host:8000 --model ./models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+CXX="$(brew --prefix llvm)/bin/clang++" cargo run -p worker -- --bind 0.0.0.0 --port 9001 --advertise-address http://worker-host:9001 --node-id worker-b --coordinator http://coordinator-host:8000 --model ./models/qwen2.5-0.5b-instruct-q4_k_m.gguf
 ```
 
 No transport or protocol changes are needed; this prototype intentionally does not add authentication, NAT traversal, retries, payments, or P2P discovery.
@@ -221,7 +229,7 @@ CXX="$(brew --prefix llvm)/bin/clang++" cargo run -p worker --features metal -- 
   --port 9001 \
   --node-id worker-a \
   --coordinator http://127.0.0.1:8000 \
-  --model ./models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+  --model ./models/qwen2.5-0.5b-instruct-q4_k_m.gguf
 ```
 
 `--device auto` probes Metal when compiled, verifies it with the smoke test, then falls back to CPU if the probe fails. An explicit `--device metal` never falls back silently: it fails startup with the full compatibility error. CUDA is not implemented yet; its protocol enum is reserved for later worker support.

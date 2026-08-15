@@ -105,6 +105,7 @@ impl GgufModelHandle {
                 max_tokens: 1,
                 temperature: None,
             },
+            cancellation: tokio_util::sync::CancellationToken::new(),
         })
         .await
         .map(|_| ())
@@ -121,6 +122,7 @@ fn generate(
         &request.tools,
         request.template.as_deref(),
         request.request_id,
+        &request.cancellation,
         GgufGenerationConfig {
             max_tokens: request.generation.max_tokens,
             temperature: request.generation.temperature.map(|value| value as f32),

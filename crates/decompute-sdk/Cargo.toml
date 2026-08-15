@@ -13,4 +13,5 @@ anyhow.workspace = true
 decompute-core = { path = "../decompute-core" }
 decompute-llama = { path = "../decompute-llama", optional = true, features = ["runtime"] }
 tokio.workspace = true
+tokio-util.workspace = true
 uuid.workspace = true

@@ -19,6 +19,7 @@ async fn main() -> Result<()> {
             template: None,
             tools: vec![],
             generation: GenerationConfig::default(),
+            cancellation: tokio_util::sync::CancellationToken::new(),
         })
         .await?;
     println!("{}", result.text);

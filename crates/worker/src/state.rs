@@ -4,8 +4,74 @@ use protocol::{
     Acceleration, GenerateRequest, GenerateResponse, GenerationStreamEvent, ModelCapability,
     ModelManifest, ModelStatus, WorkerCapabilities, WorkerState,
 };
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tokio::sync::mpsc;
+use std::{
+    collections::HashMap,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+};
+use tokio::sync::{mpsc, watch};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+struct RequestControl {
+    cancellation: CancellationToken,
+    completion: watch::Sender<bool>,
+}
+
+#[derive(Default)]
+struct RequestControls {
+    active: Mutex<HashMap<Uuid, RequestControl>>,
+}
+
+impl RequestControls {
+    fn begin(&self, request_id: Uuid) -> Option<CancellationToken> {
+        let cancellation = CancellationToken::new();
+        let (completion, _) = watch::channel(false);
+        let mut active = self.lock();
+        if active.contains_key(&request_id) {
+            return None;
+        }
+        active.insert(
+            request_id,
+            RequestControl {
+                cancellation: cancellation.clone(),
+                completion,
+            },
+        );
+        Some(cancellation)
+    }
+
+    async fn cancel(&self, request_id: Uuid) -> bool {
+        let Some((cancellation, mut completion)) = self
+            .lock()
+            .get(&request_id)
+            .map(|control| (control.cancellation.clone(), control.completion.subscribe()))
+        else {
+            return false;
+        };
+        cancellation.cancel();
+        while !*completion.borrow() {
+            if completion.changed().await.is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn finish(&self, request_id: Uuid) {
+        if let Some(control) = self.lock().remove(&request_id) {
+            control.completion.send_replace(true);
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, RequestControl>> {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
 
 pub struct WorkerRuntime {
     pub node_id: String,
@@ -17,6 +83,7 @@ pub struct WorkerRuntime {
     draining: AtomicBool,
     model: GgufModelHandle,
     acceleration: Acceleration,
+    requests: RequestControls,
 }
 
 impl WorkerRuntime {
@@ -39,6 +106,7 @@ impl WorkerRuntime {
             draining: AtomicBool::new(false),
             model,
             acceleration,
+            requests: RequestControls::default(),
         }
     }
 
@@ -94,12 +162,32 @@ impl WorkerRuntime {
             }
         }
     }
-    pub fn release(&self) {
+    fn release(&self) {
         self.active.fetch_sub(1, Ordering::AcqRel);
     }
-    pub async fn generate(&self, request: GenerateRequest) -> Result<GenerateResponse> {
+    pub fn release_unstarted_request(&self) {
+        self.release();
+    }
+    pub fn begin_request(&self, request_id: Uuid) -> Option<CancellationToken> {
+        self.requests.begin(request_id)
+    }
+    pub fn finish_request(&self, request_id: Uuid) {
+        self.requests.finish(request_id);
+        self.release();
+    }
+    pub async fn cancel_request(&self, request_id: Uuid) -> bool {
+        self.requests.cancel(request_id).await
+    }
+    pub async fn generate(
+        &self,
+        request: GenerateRequest,
+        cancellation: CancellationToken,
+    ) -> Result<GenerateResponse> {
         tracing::info!(request_id = %request.request_id, model = %request.model, "starting local inference request");
-        let generated = self.model.generate(Self::chat_request(&request)?).await?;
+        let generated = self
+            .model
+            .generate(Self::chat_request(&request, cancellation)?)
+            .await?;
         Ok(GenerateResponse {
             request_id: request.request_id,
             worker_id: self.node_id.clone(),
@@ -116,10 +204,11 @@ impl WorkerRuntime {
         &self,
         request: GenerateRequest,
         events: mpsc::Sender<GenerationStreamEvent>,
+        cancellation: CancellationToken,
     ) {
         tracing::info!(request_id = %request.request_id, model = %request.model, "starting streamed local inference request");
         let request_id = request.request_id;
-        let chat_request = match Self::chat_request(&request) {
+        let chat_request = match Self::chat_request(&request, cancellation.clone()) {
             Ok(request) => request,
             Err(error) => {
                 let _ = events
@@ -158,12 +247,16 @@ impl WorkerRuntime {
                 },
             };
             if events.send(event).await.is_err() {
+                cancellation.cancel();
                 break;
             }
         }
     }
 
-    fn chat_request(request: &GenerateRequest) -> Result<ChatRequest> {
+    fn chat_request(
+        request: &GenerateRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ChatRequest> {
         Ok(ChatRequest {
             request_id: request.request_id,
             messages: request.normalized_messages().map_err(anyhow::Error::msg)?,
@@ -173,6 +266,31 @@ impl WorkerRuntime {
                 max_tokens: request.max_tokens,
                 temperature: None,
             },
+            cancellation,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RequestControls;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn cancellation_waits_for_request_completion() {
+        let controls = RequestControls::default();
+        let id = Uuid::new_v4();
+        let cancellation = controls.begin(id).unwrap();
+        let waiter = controls.cancel(id);
+        tokio::pin!(waiter);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiter)
+                .await
+                .is_err()
+        );
+        assert!(cancellation.is_cancelled());
+        controls.finish(id);
+        assert!(waiter.await);
+        assert!(!controls.cancel(id).await);
     }
 }

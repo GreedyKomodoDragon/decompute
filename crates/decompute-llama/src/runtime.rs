@@ -13,6 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
@@ -141,6 +142,7 @@ impl GgufModel {
         tools: &[ToolDefinition],
         requested_template: Option<&str>,
         request_id: Uuid,
+        cancellation: &CancellationToken,
         config: GgufGenerationConfig,
         callback: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<GgufGenerationResult> {
@@ -159,7 +161,7 @@ impl GgufModel {
                 Ok(())
             }
         };
-        let mut generated = self.generate(&prompt, config, &mut capture)?;
+        let mut generated = self.generate(&prompt, cancellation, config, &mut capture)?;
         if !tools.is_empty() {
             let (text, tool_calls) = super::parse_tool_calls(&deferred, tools, request_id)?;
             if !text.is_empty() {
@@ -179,9 +181,11 @@ impl GgufModel {
     pub fn generate(
         &mut self,
         prompt: &str,
+        cancellation: &CancellationToken,
         config: GgufGenerationConfig,
         callback: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<GgufGenerationResult> {
+        check_cancelled(cancellation)?;
         let tokens = self
             .model
             .str_to_token(prompt, AddBos::Always)
@@ -208,6 +212,7 @@ impl GgufModel {
             .add_sequence(&tokens, 0, false)
             .context("queue GGUF prompt tokens")?;
         context.decode(&mut batch).context("prefill GGUF prompt")?;
+        check_cancelled(cancellation)?;
 
         let mut sampler = match config.temperature {
             Some(temperature) if temperature > 0.0 => {
@@ -221,6 +226,7 @@ impl GgufModel {
         let mut position = tokens.len();
 
         for _ in 0..config.max_tokens {
+            check_cancelled(cancellation)?;
             let token = sampler.sample(&context, -1);
             if self.model.is_eog_token(token) {
                 break;
@@ -234,6 +240,7 @@ impl GgufModel {
             if !piece.is_empty() {
                 callback(&piece)?;
             }
+            check_cancelled(cancellation)?;
             if position >= maximum {
                 break;
             }
@@ -261,6 +268,13 @@ impl GgufModel {
     }
 }
 
+fn check_cancelled(cancellation: &CancellationToken) -> Result<()> {
+    if cancellation.is_cancelled() {
+        bail!("generation cancelled");
+    }
+    Ok(())
+}
+
 fn backend() -> Result<&'static LlamaBackend> {
     if let Some(backend) = BACKEND.get() {
         return Ok(backend);
@@ -278,4 +292,18 @@ fn backend() -> Result<&'static LlamaBackend> {
     BACKEND
         .get()
         .ok_or_else(|| anyhow::anyhow!("llama.cpp backend did not initialize"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_cancelled;
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn cancelled_token_stops_generation_at_the_next_safe_boundary() {
+        let cancellation = CancellationToken::new();
+        assert!(check_cancelled(&cancellation).is_ok());
+        cancellation.cancel();
+        assert!(check_cancelled(&cancellation).is_err());
+    }
 }

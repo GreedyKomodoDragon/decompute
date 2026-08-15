@@ -1,5 +1,6 @@
 use anyhow::Error;
 use decompute_core::{ChatMessage, FinishReason, ToolCall, ToolDefinition};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[derive(Clone, Debug)]
@@ -11,6 +12,9 @@ pub struct ChatRequest {
     pub template: Option<String>,
     pub tools: Vec<ToolDefinition>,
     pub generation: GenerationConfig,
+    /// Cooperative cancellation checked by the native model loop between safe
+    /// llama.cpp execution steps.
+    pub cancellation: CancellationToken,
 }
 
 #[derive(Debug)]

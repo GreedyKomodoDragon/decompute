@@ -1,7 +1,7 @@
 use crate::state::WorkerRuntime;
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{
         IntoResponse,
@@ -11,9 +11,10 @@ use axum::{
 };
 use protocol::{ErrorResponse, GenerateRequest, GenerationStreamEvent};
 use std::{convert::Infallible, sync::Arc};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tracing::info;
+use uuid::Uuid;
 
 pub fn router(state: Arc<WorkerRuntime>) -> Router {
     Router::new()
@@ -21,6 +22,7 @@ pub fn router(state: Arc<WorkerRuntime>) -> Router {
         .route("/capabilities", get(capabilities))
         .route("/generate", post(generate))
         .route("/generate/stream", post(stream))
+        .route("/requests/{id}/cancel", post(cancel))
         .route("/drain", post(drain))
         .with_state(state)
 }
@@ -35,6 +37,16 @@ async fn capabilities(
 async fn drain(State(state): State<Arc<WorkerRuntime>>) -> Json<protocol::WorkerCapabilities> {
     state.drain();
     Json(state.capabilities())
+}
+async fn cancel(
+    State(state): State<Arc<WorkerRuntime>>,
+    Path(request_id): Path<Uuid>,
+) -> StatusCode {
+    if state.cancel_request(request_id).await {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
 }
 fn error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
     (
@@ -55,8 +67,13 @@ async fn generate(
         return error(StatusCode::SERVICE_UNAVAILABLE, message).into_response();
     }
     info!(request_id = %request.request_id, model = %request.model, "accepted inference request");
-    let result = state.generate(request).await;
-    state.release();
+    let request_id = request.request_id;
+    let Some(cancellation) = state.begin_request(request_id) else {
+        state.release_unstarted_request();
+        return error(StatusCode::CONFLICT, "request is already active").into_response();
+    };
+    let result = state.generate(request, cancellation).await;
+    state.finish_request(request_id);
     match result {
         Ok(response) => Json(response).into_response(),
         Err(err) => {
@@ -76,14 +93,17 @@ async fn stream(
         return error(StatusCode::SERVICE_UNAVAILABLE, message).into_response();
     }
     let (tx, rx) = mpsc::channel::<GenerationStreamEvent>(32);
-    let (finished_tx, finished_rx) = oneshot::channel();
     info!(request_id = %request.request_id, model = %request.model, "accepted streamed inference request");
+    let request_id = request.request_id;
+    let Some(cancellation) = state.begin_request(request_id) else {
+        state.release_unstarted_request();
+        return error(StatusCode::CONFLICT, "request is already active").into_response();
+    };
     let worker = state.clone();
     tokio::spawn(async move {
-        worker.stream(request, tx).await;
-        let _ = finished_tx.send(());
+        worker.stream(request, tx, cancellation).await;
+        worker.finish_request(request_id);
     });
-    let release = state.clone();
     let stream = ReceiverStream::new(rx)
         .map(move |event| {
             Ok::<_, Infallible>(
@@ -91,10 +111,6 @@ async fn stream(
             )
         })
         .chain(tokio_stream::once(Ok(Event::default().data("[DONE]"))));
-    tokio::spawn(async move {
-        let _ = finished_rx.await;
-        release.release();
-    });
     Sse::new(stream).into_response()
 }
 

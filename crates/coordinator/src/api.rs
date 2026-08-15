@@ -2,7 +2,7 @@ use crate::{
     openai::{
         self, ChatCompletionRequest, ChatCompletionResponse, ErrorResponse, Model, ModelsResponse,
     },
-    registry::Registry,
+    registry::{Registry, SelectedWorker},
 };
 use axum::{
     Json, Router,
@@ -20,8 +20,9 @@ use protocol::{
     RegisterWorkerRequest,
 };
 use std::{convert::Infallible, sync::Arc};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 pub fn router(registry: Arc<Registry>) -> Router {
@@ -93,12 +94,15 @@ async fn chat_completions(
     if wants_stream {
         return stream_request(registry, request, model).await;
     }
-    let response = match route_request(&registry, request).await {
+    let cancellation = CancellationToken::new();
+    let guard = cancellation.clone().drop_guard();
+    let response = match route_request(&registry, request, cancellation).await {
         Ok(response) => response,
         Err((status, message)) => {
             return openai_error(status, ErrorResponse::server_error(message)).into_response();
         }
     };
+    guard.disarm();
     Json(ChatCompletionResponse::from_generate(model, response)).into_response()
 }
 
@@ -145,9 +149,16 @@ async fn stream_request(
     };
     let context = openai::StreamContext::new(model, request.request_id);
     let (events, receiver) = mpsc::channel(32);
+    let cancellation = CancellationToken::new();
     info!(request_id = %request.request_id, worker = %worker.id, "worker accepted private stream; opening public SSE response");
     tokio::spawn(forward_worker_stream(
-        response, events, context, registry, worker.id,
+        response,
+        events,
+        context,
+        registry,
+        worker,
+        request.request_id,
+        cancellation,
     ));
     let events = ReceiverStream::new(receiver).map(Ok::<_, Infallible>);
     Sse::new(events).into_response()
@@ -158,14 +169,17 @@ async fn forward_worker_stream(
     events: mpsc::Sender<Event>,
     context: openai::StreamContext,
     registry: Arc<Registry>,
-    worker_id: String,
+    worker: SelectedWorker,
+    request_id: uuid::Uuid,
+    cancellation: CancellationToken,
 ) {
+    let worker_id = &worker.id;
     let mut bytes = response.bytes_stream();
     let mut pending = Vec::new();
     let mut completed = false;
     let mut first_delta = true;
     if !send_event(&events, json_event(context.role())).await {
-        registry.release(&worker_id).await;
+        cancel_and_release(&registry, &worker, request_id, cancellation).await;
         return;
     }
     while let Some(chunk) = bytes.next().await {
@@ -187,7 +201,7 @@ async fn forward_worker_stream(
                 Ok(None) => continue,
                 Err(message) => {
                     send_error(&events, message).await;
-                    registry.release(&worker_id).await;
+                    cancel_and_release(&registry, &worker, request_id, cancellation).await;
                     return;
                 }
             };
@@ -195,7 +209,7 @@ async fn forward_worker_stream(
                 Ok(event) => event,
                 Err(err) => {
                     send_error(&events, format!("invalid worker stream event: {err}")).await;
-                    registry.release(&worker_id).await;
+                    cancel_and_release(&registry, &worker, request_id, cancellation).await;
                     return;
                 }
             };
@@ -206,7 +220,7 @@ async fn forward_worker_stream(
                         first_delta = false;
                     }
                     if !send_event(&events, json_event(context.text(text))).await {
-                        registry.release(&worker_id).await;
+                        cancel_and_release(&registry, &worker, request_id, cancellation).await;
                         return;
                     }
                 }
@@ -228,7 +242,7 @@ async fn forward_worker_stream(
                         context.completed(input_tokens, output_tokens, tool_calls, finish_reason)
                     {
                         if !send_event(&events, json_event(chunk)).await {
-                            registry.release(&worker_id).await;
+                            registry.release(worker_id).await;
                             return;
                         }
                     }
@@ -237,7 +251,7 @@ async fn forward_worker_stream(
                 GenerationStreamEvent::Error { message } => {
                     tracing::error!(worker = %worker_id, error = %message, "worker reported streamed inference failure");
                     send_error(&events, message).await;
-                    registry.release(&worker_id).await;
+                    registry.release(worker_id).await;
                     return;
                 }
             }
@@ -246,11 +260,12 @@ async fn forward_worker_stream(
     if completed {
         info!(worker = %worker_id, "finished forwarding worker stream");
         let _ = events.send(Event::default().data("[DONE]")).await;
+        registry.release(worker_id).await;
     } else {
         tracing::error!(worker = %worker_id, "worker private stream ended before completion");
         send_error(&events, "worker stream ended before completion").await;
+        cancel_and_release(&registry, &worker, request_id, cancellation).await;
     }
-    registry.release(&worker_id).await;
 }
 
 async fn send_event(events: &mpsc::Sender<Event>, event: Event) -> bool {
@@ -301,6 +316,7 @@ fn sse_data(frame: &[u8]) -> Result<Option<String>, String> {
 async fn route_request(
     registry: &Arc<Registry>,
     request: GenerateRequest,
+    cancellation: CancellationToken,
 ) -> Result<GenerateResponse, (StatusCode, String)> {
     let Some(worker) = registry.select_and_reserve(&request.model).await else {
         return Err((
@@ -309,32 +325,96 @@ async fn route_request(
         ));
     };
     info!(request_id = %request.request_id, worker = %worker.id, model = %request.model, "routing OpenAI-compatible inference request");
+    let (result_tx, result_rx) = oneshot::channel();
+    tokio::spawn(forward_worker_request(
+        request,
+        worker,
+        registry.clone(),
+        cancellation,
+        result_tx,
+    ));
+    result_rx.await.unwrap_or_else(|_| {
+        Err((
+            StatusCode::BAD_GATEWAY,
+            "worker request task stopped".into(),
+        ))
+    })
+}
+
+async fn forward_worker_request(
+    request: GenerateRequest,
+    worker: SelectedWorker,
+    registry: Arc<Registry>,
+    cancellation: CancellationToken,
+    result_tx: oneshot::Sender<Result<GenerateResponse, (StatusCode, String)>>,
+) {
+    let request_id = request.request_id;
+    let request_future = async {
+        let response = reqwest::Client::new()
+            .post(format!("{}/generate", worker.address.trim_end_matches('/')))
+            .json(&request)
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() => {
+                response.json::<GenerateResponse>().await.map_err(|err| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        format!("invalid worker response: {err}"),
+                    )
+                })
+            }
+            Ok(response) => Err((
+                StatusCode::BAD_GATEWAY,
+                format!("worker returned {}", response.status()),
+            )),
+            Err(err) => {
+                registry.mark_offline(&worker.id).await;
+                Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("worker request failed: {err}"),
+                ))
+            }
+        }
+    };
+    let result = tokio::select! {
+        _ = cancellation.cancelled() => {
+            cancel_worker_request(&registry, &worker, request_id).await;
+            registry.release(&worker.id).await;
+            return;
+        }
+        result = request_future => result,
+    };
+    registry.release(&worker.id).await;
+    let _ = result_tx.send(result);
+}
+
+async fn cancel_and_release(
+    registry: &Registry,
+    worker: &SelectedWorker,
+    request_id: uuid::Uuid,
+    cancellation: CancellationToken,
+) {
+    cancellation.cancel();
+    cancel_worker_request(registry, worker, request_id).await;
+    registry.release(&worker.id).await;
+}
+
+async fn cancel_worker_request(
+    registry: &Registry,
+    worker: &SelectedWorker,
+    request_id: uuid::Uuid,
+) {
     let result = reqwest::Client::new()
-        .post(format!("{}/generate", worker.address.trim_end_matches('/')))
-        .json(&request)
+        .post(format!(
+            "{}/requests/{request_id}/cancel",
+            worker.address.trim_end_matches('/')
+        ))
         .send()
         .await;
-    registry.release(&worker.id).await;
-    match result {
-        Ok(response) if response.status().is_success() => {
-            response.json::<GenerateResponse>().await.map_err(|err| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    format!("invalid worker response: {err}"),
-                )
-            })
-        }
-        Ok(response) => Err((
-            StatusCode::BAD_GATEWAY,
-            format!("worker returned {}", response.status()),
-        )),
-        Err(err) => {
-            registry.mark_offline(&worker.id).await;
-            Err((
-                StatusCode::BAD_GATEWAY,
-                format!("worker request failed: {err}"),
-            ))
-        }
+    if let Err(error) = result {
+        tracing::warn!(worker = %worker.id, request_id = %request_id, error = %error, "worker cancellation request failed");
+        registry.mark_offline(&worker.id).await;
     }
 }
 
