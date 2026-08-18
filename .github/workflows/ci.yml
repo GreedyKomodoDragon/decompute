@@ -18,10 +18,15 @@ jobs:
       - name: Install Homebrew LLVM
         run: brew install llvm
 
-      - name: Configure native compiler
+      # Homebrew Clang needs an explicit SDK root on hosted macOS runners. This
+      # keeps CMake, cc-rs, and native dependencies such as llama.cpp aligned
+      # with the Xcode SDK rather than relying on implicit compiler discovery.
+      - name: Configure native compiler and SDK
         run: |
           echo "CC=$(brew --prefix llvm)/bin/clang" >> "$GITHUB_ENV"
           echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
+          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+          echo "MACOSX_DEPLOYMENT_TARGET=14.5" >> "$GITHUB_ENV"
 
       - name: Check formatting
         run: cargo fmt --check
