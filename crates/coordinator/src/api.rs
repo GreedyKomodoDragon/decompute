@@ -186,7 +186,7 @@ async fn forward_worker_stream(
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(err) => {
-                registry.mark_offline(&worker_id).await;
+                registry.mark_offline(worker_id).await;
                 tracing::error!(worker = %worker_id, error = %err, "worker private stream body failed");
                 send_error(&events, format!("worker stream failed: {err}")).await;
                 break;

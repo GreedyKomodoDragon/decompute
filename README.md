@@ -8,6 +8,12 @@ client -> coordinator -> worker -> local Qwen model -> worker -> coordinator -> 
 
 The coordinator only understands HTTP and the shared protocol. GGUF model loading, embedded chat templates, tokenization, and device selection are isolated to the worker/SDK side.
 
+## Project status
+
+Decompute is an experimental local-inference prototype, not production infrastructure. Its supported development platform is Apple Silicon macOS with Metal, and its public API and on-disk formats may change before a stable release. It intentionally does not implement authentication, authorization, TLS, public-network hardening, payments, P2P discovery, or multi-tenant isolation.
+
+Use it on localhost or a trusted private network only. See [SECURITY.md](SECURITY.md) before binding a coordinator or worker to a non-loopback address.
+
 ## Workspace crates
 
 | Crate | Responsibility |
@@ -45,7 +51,7 @@ The process boundary is deliberate: moving a worker to another machine only chan
 ## Prerequisites
 
 - Apple Silicon macOS with Metal. This prototype's supported local platform is macOS/Metal only.
-- Rust stable (this workspace was built with Rust 1.94)
+- Rust 1.94.0, selected automatically by `rust-toolchain.toml`
 - [just](https://github.com/casey/just), installed with `brew install just`
 - A local GGUF quantization of Qwen2.5 0.5B Instruct (the Q4_K_M file is about 400 MB)
 - The Hugging Face CLI, for example: `pipx install huggingface_hub`
@@ -56,7 +62,7 @@ Download the model once:
 just download-model
 ```
 
-The downloaded `.gguf` file contains its architecture metadata, tokenizer, and chat template.
+The recipe pins a Hugging Face revision and verifies the downloaded SHA-256. The downloaded `.gguf` file contains its architecture metadata, tokenizer, and chat template. To deliberately update the development model, update the repository revision and digest together in the `Justfile`.
 
 ## Run locally
 
@@ -222,7 +228,11 @@ Drain a worker without killing an in-flight request:
 curl -X POST http://127.0.0.1:9001/drain
 ```
 
-## Another physical machine
+## Trusted private-network worker
+
+> **Security warning:** this mode is for a trusted private network only. The coordinator and worker APIs currently have no authentication, authorization, TLS, rate limiting, or tenant isolation. Do not expose either process to the internet or an untrusted LAN.
+
+To experiment with a worker on another trusted machine, run the coordinator on a reachable interface and give the worker a reachable advertised URL:
 
 Run the coordinator on a reachable interface, then run a worker with a reachable advertised URL:
 
@@ -231,7 +241,7 @@ cargo run -p coordinator -- --bind 0.0.0.0
 CXX="$(brew --prefix llvm)/bin/clang++" cargo run -p worker -- --bind 0.0.0.0 --port 9001 --advertise-address http://worker-host:9001 --node-id worker-b --coordinator http://coordinator-host:8000 --model ./models/qwen2.5-0.5b-instruct-q4_k_m.gguf
 ```
 
-No transport or protocol changes are needed; this prototype intentionally does not add authentication, NAT traversal, retries, payments, or P2P discovery.
+No transport or protocol changes are needed. Before any public-network deployment, add authentication and TLS at a minimum; those controls are explicitly outside this prototype’s current scope.
 
 ## Devices and identity
 
@@ -249,3 +259,26 @@ CXX="$(brew --prefix llvm)/bin/clang++" cargo run -p worker --features metal -- 
 ```
 
 `--device auto` probes Metal when compiled, verifies it with the smoke test, then falls back to CPU if the probe fails. An explicit `--device metal` never falls back silently: it fails startup with the full compatibility error. CUDA is not implemented yet; its protocol enum is reserved for later worker support.
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and pull-request expectations. Run the full local validation before opening a pull request:
+
+```bash
+just test
+cargo fmt --check
+CC="$(brew --prefix llvm)/bin/clang" \
+CXX="$(brew --prefix llvm)/bin/clang++" \
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+Install the shared Git checks after cloning:
+
+```bash
+brew install lefthook
+lefthook install
+```
+
+Lefthook runs formatting, strict Clippy, and an all-feature workspace check before commits; it runs the full test suite before pushes.
+
+Please report security-sensitive issues privately as described in [SECURITY.md](SECURITY.md), rather than through a public issue.

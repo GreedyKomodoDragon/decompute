@@ -136,6 +136,11 @@ impl GgufModel {
             .context("apply embedded GGUF chat template")
     }
 
+    // The explicit inputs keep the runtime boundary clear: callers provide
+    // normalized chat, template selection, generation controls, cancellation,
+    // and streaming independently rather than constructing a runtime-specific
+    // request type.
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_chat(
         &mut self,
         messages: &[ChatMessage],

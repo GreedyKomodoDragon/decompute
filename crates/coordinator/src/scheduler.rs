@@ -58,7 +58,7 @@ mod tests {
     }
     #[test]
     fn chooses_least_active_eligible_worker() {
-        let workers = vec![
+        let workers = [
             worker("a", 1, WorkerState::Available, "tiny-model"),
             worker("b", 0, WorkerState::Available, "tiny-model"),
             worker("c", 0, WorkerState::Draining, "tiny-model"),
@@ -102,7 +102,7 @@ mod tests {
     }
     #[test]
     fn requires_exact_loaded_model() {
-        let workers = vec![worker("a", 0, WorkerState::Available, "other")];
+        let workers = [worker("a", 0, WorkerState::Available, "other")];
         assert!(select_worker(workers.iter(), "tiny-model").is_none());
     }
 }

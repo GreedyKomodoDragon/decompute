@@ -1,6 +1,12 @@
 set shell := ["zsh", "-cu"]
 
 model_path := env_var_or_default("MODEL", "./models/qwen2.5-0.5b-instruct-q4_k_m.gguf")
+model_repo := "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+model_file := "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+# Pinned Hugging Face revision for the default model. Update this value and the
+# digest together when deliberately upgrading the development model.
+model_revision := "872f8a96064a1242ac3a3359cad77c3042548405"
+model_sha256 := "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
 llvm_prefix := `brew --prefix llvm`
 
 default:
@@ -8,7 +14,8 @@ default:
 
 # Download the default Qwen GGUF used by the worker recipes.
 download-model:
-    hf download Qwen/Qwen2.5-0.5B-Instruct-GGUF qwen2.5-0.5b-instruct-q4_k_m.gguf --local-dir models
+    hf download {{model_repo}} {{model_file}} --revision {{model_revision}} --local-dir models
+    shasum -a 256 models/{{model_file}} | grep {{model_sha256}}
 
 # Start the coordinator at http://127.0.0.1:8000.
 coordinator:

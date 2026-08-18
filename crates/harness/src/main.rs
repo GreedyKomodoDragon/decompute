@@ -235,10 +235,9 @@ mod app {
                             .conversations
                             .iter_mut()
                             .find(|c| c.id == conversation)
+                            && let Some(m) = c.messages.iter_mut().find(|m| m.id == message)
                         {
-                            if let Some(m) = c.messages.iter_mut().find(|m| m.id == message) {
-                                m.content.push_str(&text);
-                            }
+                            m.content.push_str(&text);
                         }
                     }
                     Event::Completed { conversation } => {
@@ -441,10 +440,9 @@ mod app {
                                             )
                                             .on_hover_text("Stop the active generation")
                                             .clicked()
+                                            && let Some(cancel) = &self.cancel
                                         {
-                                            if let Some(cancel) = &self.cancel {
-                                                cancel.cancel();
-                                            }
+                                            cancel.cancel();
                                         }
                                         if ui.add(components::secondary("Clear")).clicked() {
                                             clear = true;
@@ -514,15 +512,13 @@ mod app {
                             }
                         });
                     });
-                if let Some(id) = remove_message {
-                    if let Some(conversation) = self.selected_mut() {
-                        conversation.messages.retain(|message| message.id != id);
-                    }
+                if let Some(id) = remove_message
+                    && let Some(conversation) = self.selected_mut()
+                {
+                    conversation.messages.retain(|message| message.id != id);
                 }
-                if clear {
-                    if let Some(conversation) = self.selected_mut() {
-                        conversation.messages.clear();
-                    }
+                if clear && let Some(conversation) = self.selected_mut() {
+                    conversation.messages.clear();
                 }
                 if send && self.cancel.is_none() && !self.draft.trim().is_empty() {
                     self.send();

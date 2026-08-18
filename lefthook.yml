@@ -1,0 +1,16 @@
+pre-commit:
+  parallel: true
+  commands:
+    format:
+      run: cargo fmt --check
+
+    check-all-features:
+      run: CC="$(brew --prefix llvm)/bin/clang" CXX="$(brew --prefix llvm)/bin/clang++" cargo check --workspace --all-targets --all-features
+
+    clippy:
+      run: CC="$(brew --prefix llvm)/bin/clang" CXX="$(brew --prefix llvm)/bin/clang++" cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+pre-push:
+  commands:
+    test:
+      run: just test

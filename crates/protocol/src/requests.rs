@@ -161,7 +161,7 @@ mod tests {
                 parameters: serde_json::json!({"type": "object"}),
             },
         };
-        assert!(validate_tools(&[tool.clone()]).is_ok());
+        assert!(validate_tools(std::slice::from_ref(&tool)).is_ok());
         assert_eq!(
             validate_tools(&[tool.clone(), tool]).unwrap_err(),
             RequestValidationError::DuplicateToolName
