@@ -115,6 +115,7 @@ mod app {
         draft: String,
         models: Vec<String>,
         status: String,
+        connected: bool,
         events: mpsc::Receiver<Event>,
         event_tx: mpsc::Sender<Event>,
         cancel: Option<CancellationToken>,
@@ -130,17 +131,20 @@ mod app {
                 .and_then(|s| eframe::get_value(s, STORAGE_KEY))
                 .unwrap_or_default();
             let (event_tx, events) = mpsc::channel();
-            Self {
+            let mut app = Self {
                 state,
                 draft: String::new(),
                 models: vec![],
                 status: "Not connected".into(),
+                connected: false,
                 events,
                 event_tx,
                 cancel: None,
                 streaming_conversation: None,
                 show_settings: false,
-            }
+            };
+            app.refresh_models();
+            app
         }
 
         fn selected_mut(&mut self) -> Option<&mut Conversation> {
@@ -211,13 +215,15 @@ mod app {
                     Event::Models(Ok(models)) => {
                         self.models = models;
                         self.status = "Connected".into();
+                        self.connected = true;
                         if self.state.settings.model.is_empty() {
                             self.state.settings.model =
                                 self.models.first().cloned().unwrap_or_default();
                         }
                     }
                     Event::Models(Err(error)) => {
-                        self.status = format!("Model discovery failed: {error}")
+                        self.status = format!("Model discovery failed: {error}");
+                        self.connected = false;
                     }
                     Event::Delta {
                         conversation,
@@ -276,88 +282,251 @@ mod app {
         fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
             self.process_events();
             ctx.request_repaint_after(Duration::from_millis(50));
+            let sidebar_width = if ctx.available_rect().width() < 860.0 {
+                208.0
+            } else {
+                248.0
+            };
             egui::SidePanel::left("conversations")
-                .exact_width(252.0)
+                .exact_width(sidebar_width)
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::SIDEBAR)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                        .inner_margin(egui::Margin::symmetric(14, theme::SPACE_16 as i8)),
+                )
                 .show(ctx, |ui| {
-                    ui.add_space(8.0);
+                    egui::TopBottomPanel::bottom("sidebar_footer")
+                        .frame(egui::Frame::NONE)
+                        .show_inside(ui, |ui| {
+                            ui.separator();
+                            ui.add_space(theme::SPACE_8);
+                            components::status(ui, self.connected, &self.status);
+                            ui.add_space(theme::SPACE_8);
+                            if ui
+                                .add_sized(
+                                    [ui.available_width(), 36.0],
+                                    components::secondary("Settings"),
+                                )
+                                .clicked()
+                            {
+                                self.show_settings = true;
+                            }
+                        });
+
                     ui.horizontal(|ui| {
                         ui.heading("decompute");
+                        ui.add_space(theme::SPACE_4);
                         ui.label(components::muted("HARNESS"));
                     });
-                    ui.add_space(12.0);
+                    ui.add_space(theme::SPACE_16);
                     if ui
                         .add_sized(
-                            [ui.available_width(), 38.0],
+                            [ui.available_width(), 42.0],
                             components::primary("+  New chat"),
                         )
                         .clicked()
                     {
                         self.new_conversation();
                     }
-                    ui.add_space(14.0);
+                    ui.add_space(theme::SPACE_16);
                     ui.label(components::muted("RECENT"));
-                    ui.add_space(4.0);
-                    for conversation in &self.state.conversations {
-                        if ui
-                            .selectable_label(
+                    ui.add_space(theme::SPACE_8);
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for conversation in &self.state.conversations {
+                            let title = navigation_title(&conversation.title, sidebar_width);
+                            if components::navigation_item(
+                                ui,
+                                &title,
                                 self.state.selected == Some(conversation.id),
-                                &conversation.title,
                             )
                             .clicked()
-                        {
-                            self.state.selected = Some(conversation.id);
+                            {
+                                self.state.selected = Some(conversation.id);
+                            }
+                            ui.add_space(theme::SPACE_4);
                         }
-                    }
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                        ui.separator();
-                        if ui.button("⚙  Settings").clicked() {
-                            self.show_settings = true;
-                        }
-                        components::status(
-                            ui,
-                            self.status == "Connected"
-                                || self.status == "Completed"
-                                || self.status == "Generating…",
-                            &self.status,
-                        );
                     });
                 });
             egui::CentralPanel::default().show(ctx, |ui| {
-                let Some(conversation) = self.selected() else { return; };
+                let Some(conversation) = self.selected() else {
+                    return;
+                };
                 let title = conversation.title.clone();
-                let chars = conversation.messages.iter().map(|m| m.content.len()).sum::<usize>()
-                    + if conversation.system_enabled { conversation.system_harness.len() } else { 0 };
+                let chars = conversation
+                    .messages
+                    .iter()
+                    .map(|message| message.content.len())
+                    .sum::<usize>()
+                    + if conversation.system_enabled {
+                        conversation.system_harness.len()
+                    } else {
+                        0
+                    };
                 let estimate = approximate_tokens(chars);
-                ui.horizontal(|ui| {
-                    ui.heading(title);
-                    ui.label(components::muted(format!("~{estimate} / {} tokens", self.state.settings.context_budget)));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        egui::ComboBox::from_id_salt("model").selected_text(&self.state.settings.model).show_ui(ui, |ui| { for model in &self.models { ui.selectable_value(&mut self.state.settings.model, model.clone(), model); } });
+
+                conversation_column(ui, |ui| {
+                    ui.add_space(theme::SPACE_8);
+                    ui.horizontal(|ui| {
+                        ui.heading(title);
+                        ui.add_space(theme::SPACE_8);
+                        ui.label(components::muted(format!(
+                            "~{estimate} / {} tokens",
+                            self.state.settings.context_budget
+                        )));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            egui::ComboBox::from_id_salt("model")
+                                .width(176.0)
+                                .selected_text(&self.state.settings.model)
+                                .show_ui(ui, |ui| {
+                                    for model in &self.models {
+                                        ui.selectable_value(
+                                            &mut self.state.settings.model,
+                                            model.clone(),
+                                            model,
+                                        );
+                                    }
+                                });
+                        });
                     });
+                    ui.add_space(theme::SPACE_12);
+                    ui.separator();
+                    ui.add_space(theme::SPACE_8);
                 });
-                if estimate + self.state.settings.max_tokens > self.state.settings.context_budget { ui.colored_label(egui::Color32::YELLOW, "This request may exceed the selected context budget. Remove messages or increase the budget."); }
-                egui::TopBottomPanel::top("system_harness").show_inside(ui, |ui| {
-                    ui.collapsing("System harness (off by default)", |ui| { if let Some(c) = self.selected_mut() { ui.checkbox(&mut c.system_enabled, "Include this system message"); ui.add_enabled(c.system_enabled, egui::TextEdit::multiline(&mut c.system_harness).desired_rows(4).hint_text("No hidden default prompt.")); } });
-                });
+
                 let mut send = false;
                 let mut clear = false;
-                egui::TopBottomPanel::bottom("composer").show_inside(ui, |ui| {
-                    components::card().show(ui, |ui| {
-                    let response = ui.add_sized([ui.available_width(), 74.0], egui::TextEdit::multiline(&mut self.draft).hint_text("Message Decompute…  Enter to send · Shift+Enter for a new line"));
-                    send |= response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter) && !input.modifiers.shift);
-                    ui.horizontal(|ui| { ui.label(components::muted("Local inference · no hidden system prompt")); ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { send |= ui.add_enabled(self.cancel.is_none() && !self.draft.trim().is_empty(), components::primary("Send ↑")).clicked(); if ui.add_enabled(self.cancel.is_some(), egui::Button::new("Stop")).clicked() { if let Some(cancel) = &self.cancel { cancel.cancel(); } } if ui.button("Clear").clicked() { clear = true; } }); });
+                egui::TopBottomPanel::bottom("composer")
+                    .show_separator_line(false)
+                    .show_inside(ui, |ui| {
+                    conversation_column(ui, |ui| {
+                        let input_id = ui.make_persistent_id("composer_input");
+                        let focused = ui.memory(|memory| memory.has_focus(input_id));
+                        components::composer_card(focused).show(ui, |ui| {
+                            let rows = self.draft.lines().count().clamp(1, 5);
+                            let response = ui.add(
+                                egui::TextEdit::multiline(&mut self.draft)
+                                    .id(input_id)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(rows)
+                                    .hint_text("Message Decompute…"),
+                            );
+                            send |= response.has_focus()
+                                && ui.input(|input| {
+                                    input.key_pressed(egui::Key::Enter) && !input.modifiers.shift
+                                });
+                            ui.add_space(theme::SPACE_8);
+                            ui.horizontal(|ui| {
+                                ui.label(components::muted(
+                                    "Local inference · no hidden system prompt",
+                                ));
+                                ui.add_space(theme::SPACE_8);
+                                ui.label(components::muted(
+                                    "Enter to send · Shift+Enter for a new line",
+                                ));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        send |= ui
+                                            .add_enabled(
+                                                self.cancel.is_none()
+                                                    && !self.draft.trim().is_empty(),
+                                                components::primary("Send"),
+                                            )
+                                            .clicked();
+                                        if ui
+                                            .add_enabled(
+                                                self.cancel.is_some(),
+                                                components::secondary("Stop"),
+                                            )
+                                            .on_hover_text("Stop the active generation")
+                                            .clicked()
+                                        {
+                                            if let Some(cancel) = &self.cancel {
+                                                cancel.cancel();
+                                            }
+                                        }
+                                        if ui.add(components::secondary("Clear")).clicked() {
+                                            clear = true;
+                                        }
+                                    },
+                                );
+                            });
+                        });
                     });
-                });
+                    ui.add_space(theme::SPACE_12);
+                    });
+
+                if estimate + self.state.settings.max_tokens > self.state.settings.context_budget {
+                    conversation_column(ui, |ui| {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            "This request may exceed the selected context budget. Remove messages or increase the budget.",
+                        );
+                    });
+                }
                 let mut remove_message = None;
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
-                    if let Some(c) = self.selected() { for message in &c.messages { let live_placeholder = message.role == Role::Assistant && message.content.is_empty() && self.streaming_conversation == Some(c.id); if message.role == Role::Assistant && message.content.is_empty() && !live_placeholder { continue; } let (surface, align_right) = match message.role { Role::User => (components::MessageSurface::User, true), Role::Assistant => (components::MessageSurface::Assistant, false), Role::Error => (components::MessageSurface::Error, false) }; let text = if live_placeholder { "Thinking…" } else { &message.content }; if components::chat_bubble(ui, ui.make_persistent_id(message.id), surface, text, align_right) { remove_message = Some(message.id); } ui.add_space(7.0); } }
+                        conversation_column(ui, |ui| {
+                            if let Some(conversation) = self.selected() {
+                                ui.add_space(theme::SPACE_24);
+                                if conversation.messages.is_empty() {
+                                    ui.add_space(theme::SPACE_32 * 2.0);
+                                    ui.heading("Start a conversation");
+                                    ui.label(components::muted(
+                                        "Decompute has no default system prompt. Ask anything to begin.",
+                                    ));
+                                }
+                                for message in &conversation.messages {
+                                    let live_placeholder = message.role == Role::Assistant
+                                        && message.content.is_empty()
+                                        && self.streaming_conversation == Some(conversation.id);
+                                    if message.role == Role::Assistant
+                                        && message.content.is_empty()
+                                        && !live_placeholder
+                                    {
+                                        continue;
+                                    }
+                                    let (surface, align_right) = match message.role {
+                                        Role::User => (components::MessageSurface::User, true),
+                                        Role::Assistant => {
+                                            (components::MessageSurface::Assistant, false)
+                                        }
+                                        Role::Error => (components::MessageSurface::Error, false),
+                                    };
+                                    let text = if live_placeholder {
+                                        "Thinking…"
+                                    } else {
+                                        &message.content
+                                    };
+                                    let response = components::chat_bubble(ui, surface, text, align_right);
+                                    response.context_menu(|ui| {
+                                        if ui.button("Delete message").clicked() {
+                                            remove_message = Some(message.id);
+                                            ui.close_menu();
+                                        }
+                                    });
+                                    ui.add_space(theme::SPACE_12);
+                                }
+                            }
+                        });
                     });
-                if let Some(id) = remove_message { if let Some(c) = self.selected_mut() { c.messages.retain(|message| message.id != id); } }
-                if clear { if let Some(c) = self.selected_mut() { c.messages.clear(); } }
-                if send && self.cancel.is_none() && !self.draft.trim().is_empty() { self.send(); }
+                if let Some(id) = remove_message {
+                    if let Some(conversation) = self.selected_mut() {
+                        conversation.messages.retain(|message| message.id != id);
+                    }
+                }
+                if clear {
+                    if let Some(conversation) = self.selected_mut() {
+                        conversation.messages.clear();
+                    }
+                }
+                if send && self.cancel.is_none() && !self.draft.trim().is_empty() {
+                    self.send();
+                }
             });
             if self.show_settings {
                 let mut open = self.show_settings;
@@ -382,6 +551,21 @@ mod app {
                                 .range(1..=8_192)
                                 .prefix("Max output: "),
                         );
+                        ui.separator();
+                        ui.collapsing("System harness", |ui| {
+                            if let Some(conversation) = self.selected_mut() {
+                                ui.checkbox(
+                                    &mut conversation.system_enabled,
+                                    "Include a system message for this chat",
+                                );
+                                ui.add_enabled(
+                                    conversation.system_enabled,
+                                    egui::TextEdit::multiline(&mut conversation.system_harness)
+                                        .desired_rows(4)
+                                        .hint_text("No hidden default prompt."),
+                                );
+                            }
+                        });
                         ui.add_space(4.0);
                         ui.label(components::muted("Settings and chats stay on this Mac."));
                     });
@@ -390,6 +574,38 @@ mod app {
                     self.refresh_models();
                 }
             }
+        }
+    }
+
+    const CONTENT_MAX_WIDTH: f32 = 980.0;
+
+    fn conversation_column(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+        let width = ui.available_width().min(CONTENT_MAX_WIDTH);
+        let outer_width = ui.available_width();
+        ui.horizontal(|ui| {
+            ui.add_space(((outer_width - width) / 2.0).max(0.0));
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, 0.0),
+                egui::Layout::top_down(egui::Align::LEFT),
+                add_contents,
+            );
+        });
+    }
+
+    fn navigation_title(title: &str, sidebar_width: f32) -> String {
+        let max_chars = if sidebar_width < 240.0 { 20 } else { 27 };
+        let mut title = title.trim().chars();
+        let Some(first) = title.next() else {
+            return "New conversation".into();
+        };
+        let normalized = format!("{}{}", first.to_uppercase(), title.collect::<String>());
+        if normalized.chars().count() > max_chars {
+            format!(
+                "{}…",
+                normalized.chars().take(max_chars - 1).collect::<String>()
+            )
+        } else {
+            normalized
         }
     }
 
@@ -602,6 +818,40 @@ mod app {
             assert_eq!(approximate_tokens(1), 1);
             assert_eq!(approximate_tokens(4), 1);
             assert_eq!(approximate_tokens(5), 2);
+        }
+
+        #[test]
+        fn conversation_column_is_centered_and_never_exceeds_its_maximum_width() {
+            let context = egui::Context::default();
+            let mut rects = None;
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1_400.0, 700.0),
+                    )),
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        let panel = ui.max_rect();
+                        conversation_column(ui, |ui| {
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 10.0),
+                                egui::Sense::hover(),
+                            );
+                            rects = Some((panel, rect));
+                        });
+                    });
+                },
+            );
+
+            let (panel, column) = rects.expect("the test column renders");
+            assert!(column.width() <= CONTENT_MAX_WIDTH + 1.0);
+            assert!(
+                (column.center().x - panel.center().x).abs() <= 1.0,
+                "conversation column must remain centred in its usable panel"
+            );
         }
     }
 }

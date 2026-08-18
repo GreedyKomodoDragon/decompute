@@ -1,7 +1,5 @@
 use crate::theme;
-use eframe::egui::{
-    self, Button, Color32, FontId, Frame, Margin, Pos2, Rect, RichText, Sense, Stroke,
-};
+use eframe::egui::{self, Button, Color32, Frame, Margin, RichText, Stroke};
 
 #[derive(Clone, Copy)]
 pub enum MessageSurface {
@@ -10,12 +8,19 @@ pub enum MessageSurface {
     Error,
 }
 
-pub fn card() -> Frame {
+pub fn composer_card(focused: bool) -> Frame {
     Frame::new()
         .fill(theme::SURFACE)
-        .stroke(Stroke::new(1.0, theme::BORDER))
-        .corner_radius(12)
-        .inner_margin(Margin::same(14))
+        .stroke(Stroke::new(
+            if focused { 1.5 } else { 1.0 },
+            if focused {
+                theme::BANANA
+            } else {
+                theme::BORDER
+            },
+        ))
+        .corner_radius(theme::RADIUS_LARGE)
+        .inner_margin(Margin::same(theme::SPACE_12 as i8))
 }
 
 fn message_text_color(surface: MessageSurface) -> Color32 {
@@ -26,27 +31,18 @@ fn message_text_color(surface: MessageSurface) -> Color32 {
     }
 }
 
+fn message_text(surface: MessageSurface, text: &str) -> RichText {
+    RichText::new(text).color(message_text_color(surface))
+}
+
 pub fn chat_bubble(
     ui: &mut egui::Ui,
-    id: egui::Id,
     surface: MessageSurface,
     text: &str,
     align_right: bool,
-) -> bool {
-    let max_width = (ui.available_width() * 0.56).clamp(260.0, 560.0);
-    let width = (text.chars().count() as f32 * 7.2 + 94.0).clamp(150.0, max_width);
-    let text_color = message_text_color(surface);
-    let galley = ui.fonts(|fonts| {
-        fonts.layout(
-            text.to_owned(),
-            FontId::proportional(15.0),
-            text_color,
-            width - 48.0,
-        )
-    });
-    let height = galley.size().y + 24.0;
-    let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
-    let rect = bubble_rect(row, width, align_right);
+) -> egui::Response {
+    const MIN_MESSAGE_WIDTH: f32 = 144.0;
+    const MAX_MESSAGE_WIDTH: f32 = 620.0;
     let (fill, stroke) = match surface {
         MessageSurface::User => (theme::BANANA, Stroke::NONE),
         MessageSurface::Assistant => (theme::SURFACE, Stroke::new(1.0, theme::BORDER)),
@@ -55,43 +51,85 @@ pub fn chat_bubble(
             Stroke::new(1.0, theme::ERROR),
         ),
     };
-    ui.painter()
-        .rect(rect, 18.0, fill, stroke, egui::StrokeKind::Inside);
-    ui.painter()
-        .galley(rect.min + egui::vec2(14.0, 12.0), galley, text_color);
-    let close = Rect::from_min_size(
-        egui::pos2(rect.right() - 26.0, rect.top() + 5.0),
-        egui::vec2(20.0, 20.0),
-    );
-    let response = ui.interact(close, id.with("delete"), Sense::click());
-    let delete_color = if response.hovered() {
-        theme::ERROR
-    } else {
-        theme::MUTED
+    let frame = Frame::new()
+        .fill(fill)
+        .stroke(stroke)
+        .corner_radius(theme::RADIUS_LARGE)
+        .inner_margin(Margin::symmetric(14, 10));
+    let content = |ui: &mut egui::Ui| {
+        ui.add(
+            egui::Label::new(message_text(surface, text))
+                .wrap()
+                .selectable(true),
+        );
     };
-    ui.painter().text(
-        close.center(),
-        egui::Align2::CENTER_CENTER,
-        "×",
-        FontId::proportional(17.0),
-        delete_color,
-    );
-    response.on_hover_text("Remove message").clicked()
-}
-
-fn bubble_rect(row: Rect, width: f32, align_right: bool) -> Rect {
-    let left = if align_right {
-        row.right() - width
+    if align_right {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+            ui.scope(|ui| {
+                ui.set_min_width(MIN_MESSAGE_WIDTH);
+                ui.set_max_width(MAX_MESSAGE_WIDTH);
+                frame.show(ui, content).response
+            })
+            .inner
+        })
+        .inner
     } else {
-        row.left()
-    };
-    Rect::from_min_size(Pos2::new(left, row.top()), egui::vec2(width, row.height()))
+        ui.scope(|ui| {
+            ui.set_min_width(MIN_MESSAGE_WIDTH);
+            ui.set_max_width(MAX_MESSAGE_WIDTH);
+            frame.show(ui, content).response
+        })
+        .inner
+    }
 }
 
 pub fn primary(label: impl Into<String>) -> Button<'static> {
     Button::new(RichText::new(label).color(theme::SIDEBAR).strong())
         .fill(theme::BANANA)
         .stroke(Stroke::NONE)
+        .corner_radius(theme::RADIUS_SMALL)
+}
+
+pub fn secondary(label: impl Into<String>) -> Button<'static> {
+    Button::new(RichText::new(label).color(theme::TEXT))
+        .fill(theme::SURFACE_RAISED)
+        .stroke(Stroke::new(1.0, theme::BORDER))
+        .corner_radius(theme::RADIUS_SMALL)
+}
+
+pub fn navigation_item(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+    let desired_size = egui::vec2(ui.available_width(), 38.0);
+    let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+    if response.clicked() {
+        response.request_focus();
+    }
+    let fill = if selected {
+        theme::BANANA.gamma_multiply(0.32)
+    } else if response.hovered() {
+        theme::SURFACE_RAISED
+    } else {
+        Color32::TRANSPARENT
+    };
+    let stroke = if response.has_focus() {
+        Stroke::new(1.0, theme::BANANA)
+    } else {
+        Stroke::NONE
+    };
+    ui.painter().rect(
+        rect,
+        theme::RADIUS_SMALL,
+        fill,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.left_center() + egui::vec2(theme::SPACE_12, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(15.0),
+        theme::TEXT,
+    );
+    response.on_hover_text(label)
 }
 
 pub fn muted(text: impl Into<String>) -> RichText {
@@ -100,7 +138,12 @@ pub fn muted(text: impl Into<String>) -> RichText {
 
 pub fn status(ui: &mut egui::Ui, online: bool, text: &str) {
     ui.horizontal(|ui| {
-        ui.colored_label(if online { theme::SUCCESS } else { theme::MUTED }, "●");
+        let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+        ui.painter().circle_filled(
+            dot_rect.center(),
+            4.0,
+            if online { theme::SUCCESS } else { theme::MUTED },
+        );
         ui.label(muted(text));
     });
 }
@@ -110,12 +153,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bubble_geometry_keeps_outgoing_messages_on_the_right() {
-        let row = Rect::from_min_size(Pos2::new(20.0, 40.0), egui::vec2(800.0, 64.0));
-        let incoming = bubble_rect(row, 260.0, false);
-        let outgoing = bubble_rect(row, 260.0, true);
-        assert_eq!(incoming.left(), row.left());
-        assert_eq!(outgoing.right(), row.right());
-        assert_eq!(incoming.width(), outgoing.width());
+    fn bubbles_anchor_to_opposite_edges_of_a_full_width_transcript() {
+        let context = egui::Context::default();
+        let mut rects = None;
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1_000.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    let available = ui.max_rect();
+                    let assistant =
+                        chat_bubble(ui, MessageSurface::Assistant, "Incoming message", false);
+                    ui.add_space(10.0);
+                    let user = chat_bubble(ui, MessageSurface::User, "Outgoing message", true);
+                    rects = Some((available, assistant.rect, user.rect));
+                });
+            },
+        );
+
+        let (available, assistant, user) = rects.expect("the test UI renders both bubbles");
+        assert!(
+            assistant.left() <= available.left() + 1.0,
+            "incoming messages should start at the transcript's left edge: {assistant:?} in {available:?}"
+        );
+        assert!(
+            user.right() >= available.right() - 1.0,
+            "outgoing messages should end at the transcript's right edge: {user:?} in {available:?}"
+        );
+        assert!(
+            user.width() < 620.0,
+            "short outgoing messages should not expand to their maximum width"
+        );
     }
 }
