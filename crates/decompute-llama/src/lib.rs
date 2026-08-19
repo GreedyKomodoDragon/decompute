@@ -8,6 +8,7 @@ use decompute_core::{Acceleration, HardwareInfo, ModelFile, ModelManifest};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
+    num::NonZeroU32,
     path::{Path, PathBuf},
 };
 use sysinfo::System;
@@ -29,6 +30,8 @@ pub use tool_calls::parse_tool_calls;
 pub struct GgufModelInfo {
     pub path: PathBuf,
     pub architecture: String,
+    /// Context capacity the model was trained to support, from GGUF metadata.
+    pub trained_context_tokens: NonZeroU32,
     pub name: Option<String>,
     pub chat_template: Option<String>,
     pub tensor_count: i64,
@@ -53,9 +56,20 @@ fn inspect_impl(path: &Path) -> Result<GgufModelInfo> {
     let architecture = metadata("general.architecture")
         .or_else(|| metadata("llama.architecture"))
         .ok_or_else(|| anyhow::anyhow!("GGUF model has no general.architecture metadata"))?;
+    let context_key = format!("{architecture}.context_length");
+    let context_index = context.find_key(&context_key);
+    if context_index < 0 {
+        bail!("GGUF model has no {context_key} metadata");
+    }
+    if context.kv_type(context_index) != llama_cpp_sys_2::GGUF_TYPE_UINT32 {
+        bail!("GGUF metadata {context_key} must be an unsigned 32-bit integer");
+    }
+    let trained_context_tokens = NonZeroU32::new(context.val_u32(context_index))
+        .ok_or_else(|| anyhow::anyhow!("GGUF metadata {context_key} must be greater than zero"))?;
     Ok(GgufModelInfo {
         path: path.to_path_buf(),
         architecture,
+        trained_context_tokens,
         name: metadata("general.name"),
         chat_template: metadata("tokenizer.chat_template"),
         tensor_count: context.n_tensors(),

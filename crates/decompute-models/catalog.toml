@@ -1,0 +1,25 @@
+# Curated, immutable model sources. A change to a model's revision or digest is
+# a deliberate compatibility update and should be reviewed like a dependency
+# upgrade.
+
+[[models]]
+id = "qwen2.5-0.5b-instruct-q4-k-m"
+display_name = "Qwen2.5 0.5B Instruct Q4_K_M"
+format = "gguf"
+repository = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+revision = "872f8a96064a1242ac3a3359cad77c3042548405"
+filename = "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+sha256 = "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
+architecture = "qwen2"
+quantization = "Q4_K_M"
+
+[[models]]
+id = "qwen2.5-1.5b-instruct-q4-k-m"
+display_name = "Qwen2.5 1.5B Instruct Q4_K_M"
+format = "gguf"
+repository = "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
+revision = "91cad51170dc346986eccefdc2dd33a9da36ead9"
+filename = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+sha256 = "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e"
+architecture = "qwen2"
+quantization = "Q4_K_M"

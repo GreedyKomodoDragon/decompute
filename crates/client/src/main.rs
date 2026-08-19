@@ -6,7 +6,7 @@ use serde_json::json;
 struct Args {
     #[arg(long, default_value = "http://127.0.0.1:8000")]
     coordinator: String,
-    #[arg(long, default_value = "tiny-model")]
+    #[arg(long, default_value = "qwen2.5-0.5b-instruct-q4-k-m")]
     model: String,
     #[arg(long)]
     prompt: String,

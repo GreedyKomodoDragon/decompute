@@ -5,7 +5,7 @@ edition.workspace = true
 
 [features]
 default = []
-runtime = ["dep:llama-cpp-2"]
+runtime = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2"]
 metal = ["runtime", "llama-cpp-2/metal"]
 
 [dependencies]
@@ -13,6 +13,7 @@ anyhow.workspace = true
 decompute-core = { path = "../decompute-core" }
 encoding_rs.workspace = true
 llama-cpp-2 = { workspace = true, optional = true }
+llama-cpp-sys-2 = { workspace = true, optional = true }
 minijinja.workspace = true
 serde.workspace = true
 serde_json.workspace = true

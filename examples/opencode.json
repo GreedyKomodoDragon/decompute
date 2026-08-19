@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "decompute/tiny-model",
+  "model": "decompute/qwen2.5-0.5b-instruct-q4-k-m",
   "provider": {
     "decompute": {
       "name": "Local Decompute",
@@ -9,11 +9,18 @@
         "baseURL": "http://127.0.0.1:8000/v1"
       },
       "models": {
-        "tiny-model": {
+        "qwen2.5-0.5b-instruct-q4-k-m": {
           "name": "Qwen2.5 0.5B via Decompute",
           "limit": {
             "context": 32768,
-            "output": 1024
+            "output": 96
+          }
+        },
+        "qwen2.5-1.5b-instruct-q4-k-m": {
+          "name": "Qwen2.5 1.5B via Decompute",
+          "limit": {
+            "context": 32768,
+            "output": 96
           }
         }
       }

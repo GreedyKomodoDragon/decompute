@@ -13,6 +13,7 @@ async-stream.workspace = true
 axum.workspace = true
 clap.workspace = true
 decompute-llama = { path = "../decompute-llama", features = ["runtime"] }
+decompute-models = { path = "../decompute-models" }
 decompute-sdk = { path = "../decompute-sdk", features = ["llama"] }
 protocol = { path = "../protocol" }
 reqwest.workspace = true

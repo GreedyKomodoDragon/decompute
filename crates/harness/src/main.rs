@@ -34,7 +34,7 @@ mod app {
         fn default() -> Self {
             Self {
                 endpoint: "http://127.0.0.1:8000".into(),
-                model: "tiny-model".into(),
+                model: "qwen2.5-0.5b-instruct-q4-k-m".into(),
                 context_budget: 2_048,
                 max_tokens: 256,
             }
@@ -216,10 +216,8 @@ mod app {
                         self.models = models;
                         self.status = "Connected".into();
                         self.connected = true;
-                        if self.state.settings.model.is_empty() {
-                            self.state.settings.model =
-                                self.models.first().cloned().unwrap_or_default();
-                        }
+                        self.state.settings.model =
+                            selected_discovered_model(&self.state.settings.model, &self.models);
                     }
                     Event::Models(Err(error)) => {
                         self.status = format!("Model discovery failed: {error}");
@@ -651,6 +649,14 @@ mod app {
     fn approximate_tokens(characters: usize) -> usize {
         characters.div_ceil(4)
     }
+
+    fn selected_discovered_model(current: &str, models: &[String]) -> String {
+        if models.iter().any(|model| model == current) {
+            current.to_owned()
+        } else {
+            models.first().cloned().unwrap_or_default()
+        }
+    }
     #[derive(Deserialize)]
     struct ModelList {
         data: Vec<Model>,
@@ -814,6 +820,22 @@ mod app {
             assert_eq!(approximate_tokens(1), 1);
             assert_eq!(approximate_tokens(4), 1);
             assert_eq!(approximate_tokens(5), 2);
+        }
+
+        #[test]
+        fn discovery_replaces_a_stale_model_and_preserves_an_available_one() {
+            let models = vec![
+                "qwen2.5-0.5b-instruct-q4-k-m".into(),
+                "qwen2.5-1.5b-instruct-q4-k-m".into(),
+            ];
+            assert_eq!(
+                selected_discovered_model("tiny-model", &models),
+                "qwen2.5-0.5b-instruct-q4-k-m"
+            );
+            assert_eq!(
+                selected_discovered_model("qwen2.5-1.5b-instruct-q4-k-m", &models),
+                "qwen2.5-1.5b-instruct-q4-k-m"
+            );
         }
 
         #[test]

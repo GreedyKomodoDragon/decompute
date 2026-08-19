@@ -11,11 +11,25 @@
       },
       "models": [
         {
-          "id": "tiny-model",
-          "name": "Decompute Tiny Model (Local)",
+          "id": "qwen2.5-0.5b-instruct-q4-k-m",
+          "name": "Qwen2.5 0.5B via Decompute",
           "reasoning": false,
           "input": ["text"],
-          "contextWindow": 2048,
+          "contextWindow": 32768,
+          "maxTokens": 96,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
+          "id": "qwen2.5-1.5b-instruct-q4-k-m",
+          "name": "Qwen2.5 1.5B via Decompute",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 32768,
           "maxTokens": 96,
           "cost": {
             "input": 0,
