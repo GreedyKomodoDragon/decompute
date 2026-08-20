@@ -4,6 +4,15 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
+use uuid::Uuid;
+
+const AFFINITY_TTL: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Clone, Debug)]
+struct AffinityBinding {
+    worker_id: String,
+    last_used: Instant,
+}
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct WorkerRecord {
@@ -27,6 +36,7 @@ pub struct SelectedWorker {
 #[derive(Default)]
 pub struct Registry {
     workers: RwLock<HashMap<String, WorkerRecord>>,
+    affinity: RwLock<HashMap<(Uuid, String), AffinityBinding>>,
 }
 
 impl Registry {
@@ -78,11 +88,42 @@ impl Registry {
         models.dedup();
         models
     }
-    pub async fn select_and_reserve(&self, model: &str) -> Option<SelectedWorker> {
+    pub async fn select_and_reserve(
+        &self,
+        model: &str,
+        session_id: Option<Uuid>,
+    ) -> Option<SelectedWorker> {
         let mut workers = self.workers.write().await;
-        let id = crate::scheduler::select_worker(workers.values(), model)?
-            .id
-            .clone();
+        let now = Instant::now();
+        let key = session_id.map(|id| (id, model.to_owned()));
+        let preferred = if let Some(key) = key.as_ref() {
+            let affinity = self.affinity.read().await;
+            affinity
+                .get(key)
+                .filter(|binding| now.duration_since(binding.last_used) <= AFFINITY_TTL)
+                .map(|binding| binding.worker_id.clone())
+        } else {
+            None
+        };
+        let id = preferred
+            .filter(|id| {
+                workers
+                    .get(id)
+                    .is_some_and(|worker| eligible(worker, model))
+            })
+            .or_else(|| {
+                crate::scheduler::select_worker(workers.values(), model)
+                    .map(|worker| worker.id.clone())
+            })?;
+        if let Some(key) = key {
+            self.affinity.write().await.insert(
+                key,
+                AffinityBinding {
+                    worker_id: id.clone(),
+                    last_used: now,
+                },
+            );
+        }
         let worker = workers.get_mut(&id)?;
         worker.active_requests += 1;
         if worker.active_requests >= worker.max_requests {
@@ -105,17 +146,37 @@ impl Registry {
         if let Some(worker) = self.workers.write().await.get_mut(id) {
             worker.state = WorkerState::Offline;
         }
+        self.affinity
+            .write()
+            .await
+            .retain(|_, binding| binding.worker_id != id);
     }
     pub async fn expire_stale(&self, timeout: Duration) {
         self.expire_at(Instant::now(), timeout).await;
     }
     async fn expire_at(&self, now: Instant, timeout: Duration) {
-        for worker in self.workers.write().await.values_mut() {
+        let mut workers = self.workers.write().await;
+        for worker in workers.values_mut() {
             if now.duration_since(worker.last_heartbeat) > timeout {
                 worker.state = WorkerState::Offline;
             }
         }
+        self.affinity.write().await.retain(|_, binding| {
+            now.duration_since(binding.last_used) <= AFFINITY_TTL
+                && workers
+                    .get(&binding.worker_id)
+                    .is_some_and(|worker| worker.state != WorkerState::Offline)
+        });
     }
+}
+
+fn eligible(worker: &WorkerRecord, model: &str) -> bool {
+    worker.state == WorkerState::Available
+        && worker.active_requests < worker.max_requests
+        && worker
+            .models
+            .iter()
+            .any(|candidate| candidate.id == model && candidate.status == ModelStatus::Loaded)
 }
 
 #[cfg(test)]

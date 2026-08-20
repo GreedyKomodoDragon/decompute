@@ -85,6 +85,7 @@ impl TryFrom<ChatCompletionRequest> for GenerateRequest {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(GenerateRequest {
             request_id: Uuid::new_v4(),
+            session_id: None,
             model: request.model,
             prompt: None,
             messages: Some(messages),
