@@ -10,6 +10,7 @@ async fn main() -> Result<()> {
     let result = model
         .generate(ChatRequest {
             request_id: Uuid::new_v4(),
+            session_id: None,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: "Why is the sky blue?".into(),

@@ -13,6 +13,7 @@ async-stream.workspace = true
 axum.workspace = true
 clap.workspace = true
 decompute-llama = { path = "../decompute-llama", features = ["runtime"] }
+decompute-core = { path = "../decompute-core" }
 decompute-models = { path = "../decompute-models" }
 decompute-sdk = { path = "../decompute-sdk", features = ["llama"] }
 protocol = { path = "../protocol" }
@@ -24,4 +25,8 @@ tokio-util.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+opentelemetry.workspace = true
+opentelemetry-appender-tracing.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
 uuid.workspace = true

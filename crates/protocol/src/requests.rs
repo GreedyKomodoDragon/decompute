@@ -5,6 +5,8 @@ use uuid::Uuid;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GenerateRequest {
     pub request_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,

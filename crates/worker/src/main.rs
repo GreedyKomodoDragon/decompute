@@ -1,11 +1,13 @@
 mod api;
 mod heartbeat;
+mod observability;
 mod resources;
 mod state;
 
 use anyhow::Result;
 use axum::Router;
 use clap::Parser;
+use decompute_core::{SessionCacheConfig, SessionCacheStats};
 use decompute_models::{ModelCatalog, ModelSource, resolve};
 use decompute_sdk::{GgufLoadConfig, GgufModelHandle};
 use protocol::Acceleration;
@@ -42,6 +44,17 @@ struct Args {
     advertise_address: Option<String>,
     #[arg(long, default_value_t = 1)]
     max_requests: usize,
+    /// Number of worker-local conversation KV contexts to retain; zero disables reuse.
+    #[arg(long, default_value_t = 1)]
+    session_cache_capacity: usize,
+    #[arg(long, default_value_t = 100)]
+    session_cache_min_tokens: usize,
+    #[arg(long, default_value_t = 0)]
+    session_cache_max_bytes: usize,
+    #[arg(long, default_value_t = 900)]
+    session_cache_idle_ttl_secs: u64,
+    #[arg(long, default_value_t = 30)]
+    session_cache_slot_wait_secs: u64,
     #[arg(long, value_enum, default_value_t = DeviceChoice::Auto)]
     device: DeviceChoice,
 }
@@ -104,23 +117,43 @@ async fn load_model(
     path: &Path,
     device: DeviceChoice,
     context_tokens: NonZeroU32,
+    session_cache: SessionCacheConfig,
+    session_cache_stats: Arc<SessionCacheStats>,
 ) -> Result<(GgufModelHandle, Acceleration)> {
     match device {
         DeviceChoice::Cpu => {
             load_and_verify(
                 path,
-                load_config(context_tokens, Some(0)),
+                load_config(
+                    context_tokens,
+                    Some(0),
+                    session_cache.clone(),
+                    session_cache_stats.clone(),
+                ),
                 Acceleration::Cpu,
             )
             .await
         }
-        DeviceChoice::Metal => load_metal(path, context_tokens).await,
+        DeviceChoice::Metal => {
+            load_metal(
+                path,
+                context_tokens,
+                session_cache.clone(),
+                session_cache_stats.clone(),
+            )
+            .await
+        }
         DeviceChoice::Auto => {
             #[cfg(feature = "metal")]
             {
                 match load_and_verify(
                     path,
-                    load_config(context_tokens, Some(u32::MAX)),
+                    load_config(
+                        context_tokens,
+                        Some(u32::MAX),
+                        session_cache.clone(),
+                        session_cache_stats.clone(),
+                    ),
                     Acceleration::Metal,
                 )
                 .await
@@ -133,7 +166,7 @@ async fn load_model(
             }
             load_and_verify(
                 path,
-                load_config(context_tokens, Some(0)),
+                load_config(context_tokens, Some(0), session_cache, session_cache_stats),
                 Acceleration::Cpu,
             )
             .await
@@ -141,10 +174,17 @@ async fn load_model(
     }
 }
 
-fn load_config(context_tokens: NonZeroU32, gpu_layers: Option<u32>) -> GgufLoadConfig {
+fn load_config(
+    context_tokens: NonZeroU32,
+    gpu_layers: Option<u32>,
+    session_cache: SessionCacheConfig,
+    session_cache_stats: Arc<SessionCacheStats>,
+) -> GgufLoadConfig {
     GgufLoadConfig {
         context_tokens: context_tokens.get(),
         gpu_layers,
+        session_cache,
+        session_cache_stats: Some(session_cache_stats),
     }
 }
 
@@ -166,10 +206,17 @@ async fn load_and_verify(
 async fn load_metal(
     path: &Path,
     context_tokens: NonZeroU32,
+    session_cache: SessionCacheConfig,
+    session_cache_stats: Arc<SessionCacheStats>,
 ) -> Result<(GgufModelHandle, Acceleration)> {
     load_and_verify(
         path,
-        load_config(context_tokens, Some(u32::MAX)),
+        load_config(
+            context_tokens,
+            Some(u32::MAX),
+            session_cache,
+            session_cache_stats,
+        ),
         Acceleration::Metal,
     )
     .await
@@ -178,13 +225,15 @@ async fn load_metal(
 async fn load_metal(
     _path: &Path,
     _context_tokens: NonZeroU32,
+    _session_cache: SessionCacheConfig,
+    _session_cache_stats: Arc<SessionCacheStats>,
 ) -> Result<(GgufModelHandle, Acceleration)> {
     anyhow::bail!("Metal support was not compiled; run with --features metal")
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    let (_observability, session_cache_stats) = observability::Observability::init()?;
     let args = Args::parse();
     let address = args
         .advertise_address
@@ -218,7 +267,21 @@ async fn main() -> Result<()> {
         "selected model context capacity"
     );
     info!(model = %resolved.entry.id, "loading local model");
-    let (model, acceleration) = load_model(&resolved.path, args.device, context_tokens).await?;
+    let session_cache = SessionCacheConfig {
+        min_tokens: args.session_cache_min_tokens,
+        max_entries: args.session_cache_capacity,
+        max_bytes: args.session_cache_max_bytes,
+        idle_ttl_ms: args.session_cache_idle_ttl_secs.saturating_mul(1_000),
+        slot_wait_timeout_ms: args.session_cache_slot_wait_secs.saturating_mul(1_000),
+    };
+    let (model, acceleration) = load_model(
+        &resolved.path,
+        args.device,
+        context_tokens,
+        session_cache.clone(),
+        session_cache_stats,
+    )
+    .await?;
     let runtime = Arc::new(WorkerRuntime::new(
         args.node_id,
         resolved.entry.id,
@@ -226,6 +289,7 @@ async fn main() -> Result<()> {
         args.max_requests,
         resolved.manifest,
         acceleration,
+        session_cache,
         model,
     ));
     heartbeat::start(runtime.clone(), args.coordinator);
@@ -262,7 +326,9 @@ mod tests {
         assert_eq!(
             load_config(
                 resolve_context_tokens(args.context_tokens, trained),
-                Some(0)
+                Some(0),
+                SessionCacheConfig::default(),
+                SessionCacheStats::shared()
             )
             .context_tokens,
             trained.get()
@@ -270,7 +336,9 @@ mod tests {
         assert_eq!(
             load_config(
                 resolve_context_tokens(args.context_tokens, trained),
-                Some(u32::MAX)
+                Some(u32::MAX),
+                SessionCacheConfig::default(),
+                SessionCacheStats::shared()
             )
             .context_tokens,
             trained.get()
