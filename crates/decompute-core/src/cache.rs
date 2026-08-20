@@ -11,7 +11,7 @@ pub struct SessionCacheConfig {
     pub min_tokens: usize,
     /// Maximum number of cached sessions.
     pub max_entries: usize,
-    /// Maximum total cached KV bytes. Zero means unlimited.
+    /// Maximum reserved KV bytes across cached contexts. Zero means unlimited.
     pub max_bytes: usize,
     /// Idle expiry in milliseconds. Zero disables idle expiry.
     pub idle_ttl_ms: u64,

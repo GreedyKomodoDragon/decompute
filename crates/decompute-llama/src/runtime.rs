@@ -90,9 +90,39 @@ struct SessionCacheEntry {
     last_used: Instant,
 }
 
+struct CacheReuseGuard {
+    stats: Option<Arc<SessionCacheStats>>,
+    committed: bool,
+}
+
+impl CacheReuseGuard {
+    fn new(stats: Option<Arc<SessionCacheStats>>, reused: bool) -> Self {
+        Self {
+            stats: reused.then_some(stats).flatten(),
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for CacheReuseGuard {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Some(stats) = &self.stats
+        {
+            stats.increment_invalidations();
+        }
+    }
+}
+
 // llama.cpp contexts are deliberately confined to the SDK's single model
-// thread. They are never concurrently accessed; this marker only permits the
-// already-created model actor to move its owned state into that thread.
+// thread. They are created and consumed only by the model actor, are never
+// concurrently accessed, and are dropped by GgufModel before its model field
+// is dropped. This marker permits the already-created model actor to move its
+// owned state into that thread.
 unsafe impl Send for SessionCacheEntry {}
 
 impl GgufModel {
@@ -119,6 +149,24 @@ impl GgufModel {
             session_cache_stats: config.session_cache_stats,
             session_cache: HashMap::new(),
         })
+    }
+
+    fn estimated_cache_bytes(&self) -> usize {
+        let embedding = usize::try_from(self.model.n_embd()).unwrap_or(0);
+        let layers = usize::try_from(self.model.n_layer()).unwrap_or(0);
+        let heads = usize::try_from(self.model.n_head()).unwrap_or(0);
+        let kv_heads = usize::try_from(self.model.n_head_kv()).unwrap_or(0);
+        let head_width = embedding.checked_div(heads).unwrap_or(embedding);
+        let kv_width = kv_heads
+            .checked_mul(head_width)
+            .filter(|width| *width > 0)
+            .unwrap_or(embedding);
+
+        (self.context_tokens as usize)
+            .saturating_mul(layers)
+            .saturating_mul(kv_width)
+            .saturating_mul(2)
+            .saturating_mul(std::mem::size_of::<f32>())
     }
 
     pub fn path(&self) -> &Path {
@@ -237,10 +285,12 @@ impl GgufModel {
         }
         let maximum = self.context_tokens as usize;
         let cache_enabled = session_id.is_some() && self.session_cache_config.max_entries > 0;
+        let prompt_is_cacheable =
+            cache_enabled && tokens.len() >= self.session_cache_config.min_tokens;
         if !cache_enabled {
             self.cache_miss();
             tracing::debug!(cache = "miss", reason = %SessionCacheMiss::Disabled.as_str(), "session cache bypassed");
-        } else if tokens.len() < self.session_cache_config.min_tokens {
+        } else if !prompt_is_cacheable {
             self.cache_miss();
             tracing::debug!(cache = "miss", reason = %SessionCacheMiss::TooShort.as_str(), "session cache bypassed for short prompt");
         }
@@ -270,7 +320,7 @@ impl GgufModel {
             }
         });
         let cached = session_id
-            .filter(|_| cache_enabled && tokens.len() >= self.session_cache_config.min_tokens)
+            .filter(|_| prompt_is_cacheable)
             .and_then(|id| self.session_cache.remove(&id).map(|entry| (id, entry)));
         let (mut context, prefix) = match cached {
             Some((_, mut entry)) if tokens.starts_with(&entry.tokens) => {
@@ -300,7 +350,10 @@ impl GgufModel {
                 )
             }
             None => {
-                self.cache_miss();
+                if prompt_is_cacheable {
+                    self.cache_miss();
+                    tracing::debug!(cache = "miss", reason = %SessionCacheMiss::Missing.as_str(), "no worker-local inference session was available");
+                }
                 (
                     self.model
                         .new_context(backend()?, context_params)
@@ -309,6 +362,7 @@ impl GgufModel {
                 )
             }
         };
+        let mut cache_reuse = CacheReuseGuard::new(self.session_cache_stats.clone(), prefix > 0);
         context
             .clear_kv_cache_seq(Some(1), None, None)
             .context("clear GGUF generation sequence")?;
@@ -317,13 +371,31 @@ impl GgufModel {
                 .copy_kv_cache_seq(0, 1, None, None)
                 .context("copy GGUF committed checkpoint")?;
         }
-        let mut batch = LlamaBatch::new(maximum, 1);
-        batch
-            .add_sequence(&tokens[prefix..], 1, false)
-            .context("queue GGUF prompt tokens")?;
-        if prefix < tokens.len() {
-            context.decode(&mut batch).context("prefill GGUF prompt")?;
+        // Re-decode the last cached token as well as the new suffix. KV cache
+        // copies do not restore llama.cpp's logits, and the wrapper's
+        // add_sequence helper starts positions at zero. Replaying from the
+        // final cached token fixes both issues while keeping all positions
+        // absolute.
+        let replay_start = prompt_replay_start(prefix);
+        if prefix > 0 {
+            context
+                .clear_kv_cache_seq(Some(1), Some(replay_start as u32), Some(prefix as u32))
+                .context("rewind GGUF prompt replay")?;
         }
+        let replay_tokens = &tokens[replay_start..];
+        let mut batch = LlamaBatch::new(maximum, 1);
+        for (offset, token) in replay_tokens.iter().enumerate() {
+            let position = replay_start + offset;
+            batch
+                .add(
+                    *token,
+                    i32::try_from(position).context("GGUF prompt position overflow")?,
+                    &[1],
+                    offset + 1 == replay_tokens.len(),
+                )
+                .context("queue GGUF prompt tokens")?;
+        }
+        context.decode(&mut batch).context("prefill GGUF prompt")?;
         check_cancelled(cancellation)?;
 
         let checkpoint_tokens = tokens.clone();
@@ -381,11 +453,8 @@ impl GgufModel {
                 .context("decode generated GGUF token")?;
             position += 1;
         }
-        if let Some(session_id) = session_id
-            .filter(|_| cache_enabled && tokens.len() >= self.session_cache_config.min_tokens)
-        {
-            let estimated_bytes =
-                checkpoint_tokens.len() * std::mem::size_of::<llama_cpp_2::token::LlamaToken>();
+        if let Some(session_id) = session_id.filter(|_| prompt_is_cacheable) {
+            let estimated_bytes = self.estimated_cache_bytes();
             if self.session_cache_config.max_bytes > 0
                 && estimated_bytes > self.session_cache_config.max_bytes
             {
@@ -403,9 +472,10 @@ impl GgufModel {
                     && self
                         .session_cache
                         .values()
-                        .map(|entry| entry.estimated_bytes)
-                        .sum::<usize>()
-                        + estimated_bytes
+                        .fold(0usize, |total, entry| {
+                            total.saturating_add(entry.estimated_bytes)
+                        })
+                        .saturating_add(estimated_bytes)
                         > self.session_cache_config.max_bytes)
             {
                 if let Some(evicted) = self
@@ -447,6 +517,7 @@ impl GgufModel {
                     last_used: now,
                 },
             );
+            cache_reuse.commit();
         }
         Ok(GgufGenerationResult {
             text: output,
@@ -455,6 +526,14 @@ impl GgufModel {
             tool_calls: vec![],
             finish_reason: FinishReason::Stop,
         })
+    }
+
+    /// Cached contexts borrow the model through llama.cpp's context type. The
+    /// cache must therefore be emptied while `model` is still alive; the
+    /// explicit drop is part of the invariant upheld by SessionCacheEntry's
+    /// lifetime extension.
+    fn drop_cached_contexts(&mut self) {
+        self.session_cache.clear();
     }
 
     fn invalidate_session(&mut self, session_id: Option<Uuid>) {
@@ -491,11 +570,21 @@ impl GgufModel {
     }
 }
 
+impl Drop for GgufModel {
+    fn drop(&mut self) {
+        self.drop_cached_contexts();
+    }
+}
+
 fn check_cancelled(cancellation: &CancellationToken) -> Result<()> {
     if cancellation.is_cancelled() {
         bail!("generation cancelled");
     }
     Ok(())
+}
+
+fn prompt_replay_start(prefix: usize) -> usize {
+    prefix.saturating_sub(1)
 }
 
 fn backend() -> Result<&'static LlamaBackend> {
@@ -519,7 +608,8 @@ fn backend() -> Result<&'static LlamaBackend> {
 
 #[cfg(test)]
 mod tests {
-    use super::check_cancelled;
+    use super::{CacheReuseGuard, check_cancelled, prompt_replay_start};
+    use decompute_core::SessionCacheStats;
     use tokio_util::sync::CancellationToken;
 
     #[test]
@@ -528,5 +618,26 @@ mod tests {
         assert!(check_cancelled(&cancellation).is_ok());
         cancellation.cancel();
         assert!(check_cancelled(&cancellation).is_err());
+    }
+
+    #[test]
+    fn prompt_replay_includes_the_last_cached_token() {
+        assert_eq!(prompt_replay_start(0), 0);
+        assert_eq!(prompt_replay_start(1), 0);
+        assert_eq!(prompt_replay_start(128), 127);
+    }
+
+    #[test]
+    fn failed_cache_reuse_is_invalidated_but_committed_reuse_is_not() {
+        let stats = SessionCacheStats::shared();
+        {
+            let _guard = CacheReuseGuard::new(Some(stats.clone()), true);
+        }
+        assert_eq!(stats.snapshot()[4], 1);
+        {
+            let mut guard = CacheReuseGuard::new(Some(stats.clone()), true);
+            guard.commit();
+        }
+        assert_eq!(stats.snapshot()[4], 1);
     }
 }
