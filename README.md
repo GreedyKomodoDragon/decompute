@@ -19,11 +19,12 @@ Use it on localhost or a trusted private network only. See [SECURITY.md](SECURIT
 | Crate | Responsibility |
 | --- | --- |
 | `protocol` | Shared, serializable network types: model capabilities, worker registration and heartbeats, chat/generation requests/responses, API errors, hardware data, and manifests. It has no HTTP or inference dependency. |
-| `inference-example` | Small executable for proving local GGUF inference before networking. It loads `./models/tiny-model.gguf` and prints generated text. |
+| `inference-example` | Small executable for proving local GGUF inference before networking. It intentionally loads a local GGUF file directly, without provisioning or networking. |
 | `worker` | Process that owns a complete local model. Its Axum server exposes health, capabilities, generation, SSE streaming, and draining endpoints. The SDK owns blocking llama.cpp inference on a dedicated OS thread, so Tokio remains free for HTTP and heartbeats. |
 | `coordinator` | Inference-library-free Axum service. It exposes an OpenAI Chat Completions-compatible API, stores worker records, expires stale heartbeats, selects the least-busy eligible worker with an exact model match, and proxies private inference requests. |
 | `client` | Small CLI client for the coordinator's OpenAI-compatible endpoint. `curl` or OpenCode are the preferred API clients. |
 | `harness` | Native macOS Apple-Silicon egui chat client. It uses only OpenAI-compatible models/chat-completions/SSE endpoints and has no inference or protocol dependency. |
+| `decompute-models` | Curated model catalog, Hugging Face cache/download resolution, checksum verification, and model provenance. It has no inference, coordinator, or UI dependency. |
 
 ## In-process SDK foundations
 
@@ -34,13 +35,14 @@ The workspace now separates reusable local-inference concerns from network trans
 | `decompute-core` | Transport-neutral chat, tool-call, model-manifest, and hardware types. |
 | `decompute-sdk` | Public async-facing GGUF model handle backed by a dedicated model thread and progressive generation events. |
 | `decompute-llama` | Opt-in GGUF/llama.cpp runtime: metadata inspection, model loading, embedded-template rendering, token generation, and optional Metal compilation. |
+| `decompute-models` | Reusable model-provisioning layer. It resolves a curated catalog entry to a verified local GGUF file before the SDK loads it. |
 
 `protocol` re-exports the domain types from `decompute-core` for source compatibility, but continues to own HTTP worker/coordinator payloads and lifecycle state. Neither `protocol` nor `coordinator` depends on a model runtime.
 
 The llama.cpp binding compiles native C++ code. On this Mac, build it with Homebrew LLVM rather than the incomplete Command Line Tools C++ driver:
 
 ```bash
-CXX="$(brew --prefix llvm)/bin/clang++" \
+CC="$(brew --prefix llvm)/bin/clang" CXX="$(brew --prefix llvm)/bin/clang++" \
   cargo check -p decompute-sdk --features llama
 ```
 
@@ -53,23 +55,18 @@ The process boundary is deliberate: moving a worker to another machine only chan
 - Apple Silicon macOS with Metal. This prototype's supported local platform is macOS/Metal only.
 - Rust 1.94.0, selected automatically by `rust-toolchain.toml`
 - [just](https://github.com/casey/just), installed with `brew install just`
-- A local GGUF quantization of Qwen2.5 0.5B Instruct (the Q4_K_M file is about 400 MB)
-- The Hugging Face CLI, for example: `pipx install huggingface_hub`
+- Internet access for the first worker start. The curated Qwen2.5 Q4_K_M downloads are about 469 MB (0.5B) and 1.12 GB (1.5B).
 
-Download the model once:
+Workers automatically resolve their selected curated model from Hugging Face before loading it. The catalog pins the repository revision and SHA-256, and the worker verifies the complete file before it can register. No Hugging Face CLI is required.
 
-```bash
-just download-model
-```
-
-The recipe pins a Hugging Face revision and verifies the downloaded SHA-256. The downloaded `.gguf` file contains its architecture metadata, tokenizer, and chat template. To deliberately update the development model, update the repository revision and digest together in the `Justfile`.
+The Hugging Face cache defaults to the standard `~/.cache/huggingface/hub` location. Set `HF_HOME` or `HF_HUB_CACHE` to relocate it. For gated/private catalog entries, Hugging Face's standard credential resolution is used, including `HF_TOKEN` and its local token store; Decompute never persists, logs, forwards, or exposes credentials.
 
 ## Run locally
 
 First check standalone inference:
 
 ```bash
-CXX="$(brew --prefix llvm)/bin/clang++" cargo run -p inference-example
+CC="$(brew --prefix llvm)/bin/clang" CXX="$(brew --prefix llvm)/bin/clang++" cargo run -p inference-example
 ```
 
 Then use four terminals:
@@ -86,6 +83,8 @@ just worker-a
 just worker-b
 ```
 
+Both default workers load Qwen2.5 0.5B, so repeated requests for that model exercise exact-match scheduling, load balancing, and worker redundancy. After both workers are ready, `GET /v1/models` and **Connect / refresh models** in the harness show the loaded model ID.
+
 In a fourth terminal, start the native macOS chat harness:
 
 ```bash
@@ -95,7 +94,7 @@ just harness
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"tiny-model","messages":[{"role":"user","content":"Why is the sky blue?"}],"max_tokens":100}'
+  -d '{"model":"qwen2.5-0.5b-instruct-q4-k-m","messages":[{"role":"user","content":"Why is the sky blue?"}],"max_tokens":100}'
 ```
 
 The public API is OpenAI Chat Completions-compatible: `POST /v1/chat/completions` and `GET /v1/models`. The coordinator selects a worker and proxies a private request; clients never receive worker addresses. Inspect the internal registry with `curl http://127.0.0.1:8000/workers`.
@@ -108,18 +107,35 @@ The harness sends no hidden system message. Its **System harness** editor is dis
 
 Chats and settings persist locally. The context indicator is intentionally only an estimate (characters divided by four), because a generic OpenAI-compatible model listing does not expose tokenizer or context metadata. The harness never silently drops or summarizes history: remove messages or clear a chat yourself when the estimate exceeds the editable context budget. Press **Stop** to abandon a stream; the coordinator then cancels the corresponding worker generation.
 
-By default, the worker recipes use `./models/qwen2.5-0.5b-instruct-q4_k_m.gguf`. Override it for another GGUF model:
+Each worker checks its Hugging Face cache, downloads the pinned file if necessary, verifies its SHA-256, then starts inference. Workers load exactly one selected model, and share the cache safely. To test multi-model discovery instead of same-model scheduling, run `just worker-b-1-5b` in place of `just worker-b`.
+
+Override either recipe without changing the harness or coordinator:
 
 ```bash
-MODEL=./models/another-model.gguf just worker-a
+WORKER_A_MODEL_ID=qwen2.5-1.5b-instruct-q4-k-m just worker-a
+WORKER_B_MODEL_ID=qwen2.5-1.5b-instruct-q4-k-m just worker-b
 ```
+
+To run offline with an already-downloaded copy of that exact catalog model, use `--model-path`; it is still GGUF and SHA-256 verified:
+
+```bash
+CC="$(brew --prefix llvm)/bin/clang" CXX="$(brew --prefix llvm)/bin/clang++" cargo run -p worker --features metal -- \
+  --device metal --port 9001 --node-id worker-a \
+  --coordinator http://127.0.0.1:8000 \
+  --model qwen2.5-0.5b-instruct-q4-k-m \
+  --model-path ./models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+```
+
+Workers default to `--context-tokens auto`, which reads the GGUF model's trained context length from its metadata before loading inference tensors. Pass `--context-tokens <non-zero-value>` to explicitly override that capacity. Larger contexts consume more unified memory for the KV cache, so configure every OpenAI-compatible client with a context limit no greater than the capacity reported in the worker startup log. The included OpenCode and Pi examples advertise the 32,768-token context stored by the curated Qwen models.
+
+The catalog is embedded from [`crates/decompute-models/catalog.toml`](crates/decompute-models/catalog.toml). Add a model by creating a pinned `gguf` entry with its repository, full revision, filename, SHA-256, architecture, and quantization. The harness does not need changing: it discovers only the model IDs loaded by workers through `GET /v1/models`.
 
 ### Chat messages and model templates
 
 Requests use standard OpenAI `messages`:
 
 ```json
-{"model":"tiny-model","messages":[{"role":"user","content":"Why is the sky blue?"}],"max_tokens":100}
+{"model":"qwen2.5-0.5b-instruct-q4-k-m","messages":[{"role":"user","content":"Why is the sky blue?"}],"max_tokens":100}
 ```
 
 For system instructions and chat history, pass structured messages:
@@ -128,7 +144,7 @@ For system instructions and chat history, pass structured messages:
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "tiny-model",
+    "model": "qwen2.5-0.5b-instruct-q4-k-m",
     "messages": [
       {"role": "system", "content": "Answer in one sentence."},
       {"role": "user", "content": "Why is the sky blue?"}
@@ -149,7 +165,7 @@ The HTTP API accepts OpenAI-style tool definitions and tool-history messages. Fo
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "tiny-model",
+    "model": "qwen2.5-0.5b-instruct-q4-k-m",
     "messages": [{"role": "user", "content": "What time is it in London?"}],
     "tools": [{
       "type": "function",
@@ -174,7 +190,7 @@ The client owns the execution loop: validate and execute each proposed call in i
 Copy [`examples/opencode.json`](examples/opencode.json) into your OpenCode project configuration (or merge its `provider.decompute` entry with your existing configuration). With the coordinator and at least one worker running, use:
 
 ```bash
-opencode run --model decompute/tiny-model "Explain this repository and suggest one small improvement."
+opencode run --model decompute/qwen2.5-0.5b-instruct-q4-k-m "Explain this repository and suggest one small improvement."
 ```
 
 Use the model ID returned by `GET /v1/models` if your workers advertise a different model. OpenCode communicates only with the coordinator. It executes file, shell, and other coding tools on the OpenCode machine; Decompute workers only receive private model-inference requests.
@@ -184,7 +200,7 @@ Use the model ID returned by `GET /v1/models` if your workers advertise a differ
 Pi can use the same OpenAI-compatible coordinator. Merge the `decompute` provider from [`examples/pi-models.json`](examples/pi-models.json) into `~/.pi/agent/models.json`, then make a deliberately small no-tools request while testing the initial model setup:
 
 ```bash
-pi --provider decompute --model tiny-model \
+pi --provider decompute --model qwen2.5-0.5b-instruct-q4-k-m \
   --no-session --no-tools \
   --system-prompt 'Reply concisely.' \
   --print 'Reply with exactly: hello'
@@ -210,7 +226,7 @@ Top-level `*.jinja` files are selectable by filename without the extension. They
 
 ```json
 {
-  "model": "tiny-model",
+  "model": "qwen2.5-0.5b-instruct-q4-k-m",
   "template": "rag",
   "messages": [{"role": "user", "content": "Summarize this context."}]
 }
@@ -238,7 +254,7 @@ Run the coordinator on a reachable interface, then run a worker with a reachable
 
 ```bash
 cargo run -p coordinator -- --bind 0.0.0.0
-CXX="$(brew --prefix llvm)/bin/clang++" cargo run -p worker -- --bind 0.0.0.0 --port 9001 --advertise-address http://worker-host:9001 --node-id worker-b --coordinator http://coordinator-host:8000 --model ./models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+CC="$(brew --prefix llvm)/bin/clang" CXX="$(brew --prefix llvm)/bin/clang++" cargo run -p worker -- --bind 0.0.0.0 --port 9001 --advertise-address http://worker-host:9001 --node-id worker-b --coordinator http://coordinator-host:8000 --model qwen2.5-0.5b-instruct-q4-k-m
 ```
 
 No transport or protocol changes are needed. Before any public-network deployment, add authentication and TLS at a minimum; those controls are explicitly outside this prototype’s current scope.
@@ -250,12 +266,12 @@ The worker reads GGUF metadata to identify the model architecture and computes a
 Apple Metal is the supported local acceleration target and does not alter the network protocol. Build with the feature and explicitly select Metal:
 
 ```bash
-CXX="$(brew --prefix llvm)/bin/clang++" cargo run -p worker --features metal -- \
+CC="$(brew --prefix llvm)/bin/clang" CXX="$(brew --prefix llvm)/bin/clang++" cargo run -p worker --features metal -- \
   --device metal \
   --port 9001 \
   --node-id worker-a \
   --coordinator http://127.0.0.1:8000 \
-  --model ./models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+  --model qwen2.5-0.5b-instruct-q4-k-m
 ```
 
 `--device auto` probes Metal when compiled, verifies it with the smoke test, then falls back to CPU if the probe fails. An explicit `--device metal` never falls back silently: it fails startup with the full compatibility error. CUDA is not implemented yet; its protocol enum is reserved for later worker support.

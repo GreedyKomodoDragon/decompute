@@ -1,0 +1,16 @@
+[package]
+name = "decompute-models"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+decompute-core = { path = "../decompute-core" }
+hf-hub = "1"
+serde.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
