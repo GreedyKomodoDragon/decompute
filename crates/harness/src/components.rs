@@ -1,5 +1,7 @@
 use crate::theme;
-use eframe::egui::{self, Button, Color32, Frame, Margin, RichText, Stroke};
+use eframe::egui::{
+    self, Button, Color32, Frame, Margin, RichText, Stroke, WidgetInfo, WidgetType,
+};
 
 #[derive(Clone, Copy)]
 pub enum MessageSurface {
@@ -97,20 +99,46 @@ pub fn secondary(label: impl Into<String>) -> Button<'static> {
         .corner_radius(theme::RADIUS_SMALL)
 }
 
-pub fn navigation_item(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+pub struct NavigationItemResponse {
+    pub select: egui::Response,
+    pub delete: egui::Response,
+}
+
+pub fn navigation_item(
+    ui: &mut egui::Ui,
+    conversation_id: uuid::Uuid,
+    label: &str,
+    selected: bool,
+) -> NavigationItemResponse {
+    const DELETE_WIDTH: f32 = 34.0;
     let desired_size = egui::vec2(ui.available_width(), 38.0);
-    let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
-    if response.clicked() {
-        response.request_focus();
+    let (rect, _) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+    let select_rect =
+        egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x - DELETE_WIDTH, rect.max.y));
+    let id = ui.make_persistent_id(("conversation", conversation_id));
+    let select = ui.interact(select_rect, id.with("select"), egui::Sense::click());
+    select.widget_info(|| WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), label));
+    if select.clicked() {
+        select.request_focus();
     }
+    let delete_rect =
+        egui::Rect::from_min_max(egui::pos2(rect.max.x - DELETE_WIDTH, rect.min.y), rect.max);
+    let delete = ui.interact(delete_rect, id.with("delete"), egui::Sense::click());
+    delete.widget_info(|| {
+        WidgetInfo::labeled(
+            WidgetType::Button,
+            ui.is_enabled(),
+            format!("Delete chat: {label}"),
+        )
+    });
     let fill = if selected {
         theme::BANANA.gamma_multiply(0.32)
-    } else if response.hovered() {
+    } else if select.hovered() || delete.hovered() {
         theme::SURFACE_RAISED
     } else {
         Color32::TRANSPARENT
     };
-    let stroke = if response.has_focus() {
+    let stroke = if select.has_focus() || delete.has_focus() {
         Stroke::new(1.0, theme::BANANA)
     } else {
         Stroke::NONE
@@ -129,7 +157,19 @@ pub fn navigation_item(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::
         egui::FontId::proportional(15.0),
         theme::TEXT,
     );
-    response.on_hover_text(label)
+    if selected || select.hovered() || delete.hovered() {
+        ui.painter().text(
+            delete_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "×",
+            egui::FontId::proportional(18.0),
+            theme::MUTED,
+        );
+    }
+    NavigationItemResponse {
+        select: select.on_hover_text(label),
+        delete: delete.on_hover_text(format!("Delete chat: {label}")),
+    }
 }
 
 pub fn muted(text: impl Into<String>) -> RichText {

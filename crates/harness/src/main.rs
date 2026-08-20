@@ -104,10 +104,20 @@ mod app {
         Completed {
             conversation: Uuid,
         },
+        Cancelled {
+            conversation: Uuid,
+        },
         Failed {
             conversation: Uuid,
             message: String,
         },
+    }
+
+    struct ActiveStream {
+        conversation: Uuid,
+        user_message: Uuid,
+        assistant_message: Uuid,
+        cancellation: CancellationToken,
     }
 
     pub struct HarnessApp {
@@ -118,8 +128,8 @@ mod app {
         connected: bool,
         events: mpsc::Receiver<Event>,
         event_tx: mpsc::Sender<Event>,
-        cancel: Option<CancellationToken>,
-        streaming_conversation: Option<Uuid>,
+        active_stream: Option<ActiveStream>,
+        pending_delete: Option<Uuid>,
         show_settings: bool,
     }
 
@@ -139,12 +149,30 @@ mod app {
                 connected: false,
                 events,
                 event_tx,
-                cancel: None,
-                streaming_conversation: None,
+                active_stream: None,
+                pending_delete: None,
                 show_settings: false,
             };
             app.refresh_models();
             app
+        }
+
+        #[cfg(test)]
+        fn for_test(cc: &eframe::CreationContext<'_>, state: SavedState) -> Self {
+            theme::apply(&cc.egui_ctx);
+            let (event_tx, events) = mpsc::channel();
+            Self {
+                state,
+                draft: String::new(),
+                models: vec!["qwen2.5-0.5b-instruct-q4-k-m".into()],
+                status: "Connected".into(),
+                connected: true,
+                events,
+                event_tx,
+                active_stream: None,
+                pending_delete: None,
+                show_settings: false,
+            }
         }
 
         fn selected_mut(&mut self) -> Option<&mut Conversation> {
@@ -166,6 +194,65 @@ mod app {
             self.state.selected = Some(conversation.id);
             self.state.conversations.push(conversation);
         }
+        fn cancel_stream_for(&mut self, conversation: Uuid) -> bool {
+            let Some(stream) = self
+                .active_stream
+                .as_ref()
+                .filter(|stream| stream.conversation == conversation)
+            else {
+                return false;
+            };
+            stream.cancellation.cancel();
+            self.status = "Cancelling…".into();
+            true
+        }
+        fn remove_conversation(&mut self, id: Uuid) {
+            let Some(index) = self
+                .state
+                .conversations
+                .iter()
+                .position(|conversation| conversation.id == id)
+            else {
+                return;
+            };
+            self.cancel_stream_for(id);
+            let was_selected = self.state.selected == Some(id);
+            self.state.conversations.remove(index);
+            if self.state.conversations.is_empty() {
+                let conversation = Conversation::new();
+                self.state.selected = Some(conversation.id);
+                self.state.conversations.push(conversation);
+            } else if was_selected {
+                let replacement = index.min(self.state.conversations.len() - 1);
+                self.state.selected = Some(self.state.conversations[replacement].id);
+            }
+            if was_selected {
+                self.draft.clear();
+            }
+        }
+        fn clear_selected_conversation(&mut self) {
+            let Some(id) = self.state.selected else {
+                return;
+            };
+            self.cancel_stream_for(id);
+            if let Some(conversation) = self.selected_mut() {
+                conversation.messages.clear();
+            }
+        }
+        fn remove_selected_message(&mut self, id: Uuid) {
+            let Some(conversation) = self.state.selected else {
+                return;
+            };
+            if self.active_stream.as_ref().is_some_and(|stream| {
+                stream.conversation == conversation
+                    && (stream.user_message == id || stream.assistant_message == id)
+            }) {
+                self.cancel_stream_for(conversation);
+            }
+            if let Some(conversation) = self.selected_mut() {
+                conversation.messages.retain(|message| message.id != id);
+            }
+        }
         fn refresh_models(&mut self) {
             self.status = "Loading models…".into();
             let endpoint = self.state.settings.endpoint.clone();
@@ -175,7 +262,7 @@ mod app {
             });
         }
         fn send(&mut self) {
-            if self.draft.trim().is_empty() || self.cancel.is_some() {
+            if self.draft.trim().is_empty() || self.active_stream.is_some() {
                 return;
             }
             let settings = self.state.settings.clone();
@@ -183,8 +270,9 @@ mod app {
             let Some(conversation) = self.selected_mut() else {
                 return;
             };
+            let user_id = Uuid::new_v4();
             let user = Message {
-                id: Uuid::new_v4(),
+                id: user_id,
                 role: Role::User,
                 content,
             };
@@ -201,8 +289,12 @@ mod app {
             let request = Request::from_conversation(&settings, conversation);
             let id = conversation.id;
             let cancel = CancellationToken::new();
-            self.cancel = Some(cancel.clone());
-            self.streaming_conversation = Some(id);
+            self.active_stream = Some(ActiveStream {
+                conversation: id,
+                user_message: user_id,
+                assistant_message: assistant,
+                cancellation: cancel.clone(),
+            });
             self.status = "Generating…".into();
             let tx = self.event_tx.clone();
             spawn(async move {
@@ -239,19 +331,35 @@ mod app {
                         }
                     }
                     Event::Completed { conversation } => {
-                        if self.streaming_conversation == Some(conversation) {
-                            self.cancel = None;
-                            self.streaming_conversation = None;
+                        if self
+                            .active_stream
+                            .as_ref()
+                            .is_some_and(|stream| stream.conversation == conversation)
+                        {
+                            self.active_stream = None;
                             self.status = "Completed".into();
+                        }
+                    }
+                    Event::Cancelled { conversation } => {
+                        if self
+                            .active_stream
+                            .as_ref()
+                            .is_some_and(|stream| stream.conversation == conversation)
+                        {
+                            self.active_stream = None;
+                            self.status = "Generation cancelled".into();
                         }
                     }
                     Event::Failed {
                         conversation,
                         message,
                     } => {
-                        if self.streaming_conversation == Some(conversation) {
-                            self.cancel = None;
-                            self.streaming_conversation = None;
+                        if self
+                            .active_stream
+                            .as_ref()
+                            .is_some_and(|stream| stream.conversation == conversation)
+                        {
+                            self.active_stream = None;
                             self.status = "Request failed".into();
                         }
                         if let Some(c) = self
@@ -329,21 +437,32 @@ mod app {
                     ui.add_space(theme::SPACE_16);
                     ui.label(components::muted("RECENT"));
                     ui.add_space(theme::SPACE_8);
+                    let mut select_conversation = None;
+                    let mut delete_conversation = None;
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for conversation in &self.state.conversations {
                             let title = navigation_title(&conversation.title, sidebar_width);
-                            if components::navigation_item(
+                            let response = components::navigation_item(
                                 ui,
+                                conversation.id,
                                 &title,
                                 self.state.selected == Some(conversation.id),
-                            )
-                            .clicked()
-                            {
-                                self.state.selected = Some(conversation.id);
+                            );
+                            if response.select.clicked() {
+                                select_conversation = Some(conversation.id);
+                            }
+                            if response.delete.clicked() {
+                                delete_conversation = Some(conversation.id);
                             }
                             ui.add_space(theme::SPACE_4);
                         }
                     });
+                    if let Some(id) = select_conversation {
+                        self.state.selected = Some(id);
+                    }
+                    if let Some(id) = delete_conversation {
+                        self.pending_delete = Some(id);
+                    }
                 });
             egui::CentralPanel::default().show(ctx, |ui| {
                 let Some(conversation) = self.selected() else {
@@ -426,21 +545,24 @@ mod app {
                                     |ui| {
                                         send |= ui
                                             .add_enabled(
-                                                self.cancel.is_none()
+                                                self.active_stream.is_none()
                                                     && !self.draft.trim().is_empty(),
                                                 components::primary("Send"),
                                             )
                                             .clicked();
                                         if ui
                                             .add_enabled(
-                                                self.cancel.is_some(),
+                                                self.active_stream.is_some(),
                                                 components::secondary("Stop"),
                                             )
                                             .on_hover_text("Stop the active generation")
                                             .clicked()
-                                            && let Some(cancel) = &self.cancel
+                                            && let Some(conversation) = self
+                                                .active_stream
+                                                .as_ref()
+                                                .map(|stream| stream.conversation)
                                         {
-                                            cancel.cancel();
+                                            self.cancel_stream_for(conversation);
                                         }
                                         if ui.add(components::secondary("Clear")).clicked() {
                                             clear = true;
@@ -479,7 +601,10 @@ mod app {
                                 for message in &conversation.messages {
                                     let live_placeholder = message.role == Role::Assistant
                                         && message.content.is_empty()
-                                        && self.streaming_conversation == Some(conversation.id);
+                                        && self.active_stream.as_ref().is_some_and(|stream| {
+                                            stream.conversation == conversation.id
+                                                && stream.assistant_message == message.id
+                                        });
                                     if message.role == Role::Assistant
                                         && message.content.is_empty()
                                         && !live_placeholder
@@ -510,18 +635,56 @@ mod app {
                             }
                         });
                     });
-                if let Some(id) = remove_message
-                    && let Some(conversation) = self.selected_mut()
-                {
-                    conversation.messages.retain(|message| message.id != id);
+                if let Some(id) = remove_message {
+                    self.remove_selected_message(id);
                 }
-                if clear && let Some(conversation) = self.selected_mut() {
-                    conversation.messages.clear();
+                if clear {
+                    self.clear_selected_conversation();
                 }
-                if send && self.cancel.is_none() && !self.draft.trim().is_empty() {
+                if send && self.active_stream.is_none() && !self.draft.trim().is_empty() {
                     self.send();
                 }
             });
+            if let Some(id) = self.pending_delete {
+                let title = self
+                    .state
+                    .conversations
+                    .iter()
+                    .find(|conversation| conversation.id == id)
+                    .map(|conversation| conversation.title.clone())
+                    .unwrap_or_else(|| "this conversation".into());
+                let active = self
+                    .active_stream
+                    .as_ref()
+                    .is_some_and(|stream| stream.conversation == id);
+                let mut open = true;
+                egui::Window::new("Delete conversation?")
+                    .id(egui::Id::new("delete_conversation_confirmation"))
+                    .collapsible(false)
+                    .resizable(false)
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        ui.label(format!("Delete \"{title}\"?"));
+                        if active {
+                            ui.label(components::muted(
+                                "Its active generation will be stopped before it is removed.",
+                            ));
+                        }
+                        ui.add_space(theme::SPACE_12);
+                        ui.horizontal(|ui| {
+                            if ui.add(components::secondary("Cancel")).clicked() {
+                                self.pending_delete = None;
+                            }
+                            if ui.add(components::primary("Delete chat")).clicked() {
+                                self.remove_conversation(id);
+                                self.pending_delete = None;
+                            }
+                        });
+                    });
+                if !open {
+                    self.pending_delete = None;
+                }
+            }
             if self.show_settings {
                 let mut open = self.show_settings;
                 let mut refresh = false;
@@ -688,7 +851,7 @@ mod app {
     ) {
         let client = reqwest::Client::new();
         let response = tokio::select! {
-            _ = cancel.cancelled() => { let _ = tx.send(Event::Completed { conversation }); return; }
+            _ = cancel.cancelled() => { let _ = tx.send(Event::Cancelled { conversation }); return; }
             response = client.post(format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'))).json(&request).send() => response,
         };
         let response = match response {
@@ -714,7 +877,7 @@ mod app {
         let mut buffer = Vec::new();
         loop {
             let next = tokio::select! {
-                _ = cancel.cancelled() => { let _ = tx.send(Event::Completed { conversation }); return; }
+                _ = cancel.cancelled() => { let _ = tx.send(Event::Cancelled { conversation }); return; }
                 next = stream.next() => next,
             };
             let Some(next) = next else {
@@ -785,6 +948,49 @@ mod app {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn conversation(title: &str) -> Conversation {
+            Conversation {
+                id: Uuid::new_v4(),
+                title: title.into(),
+                system_enabled: false,
+                system_harness: String::new(),
+                messages: vec![],
+            }
+        }
+
+        fn test_app(conversations: Vec<Conversation>, selected: Option<Uuid>) -> HarnessApp {
+            let (event_tx, events) = mpsc::channel();
+            HarnessApp {
+                state: SavedState {
+                    settings: Settings::default(),
+                    conversations,
+                    selected,
+                },
+                draft: String::new(),
+                models: vec![],
+                status: "Connected".into(),
+                connected: true,
+                events,
+                event_tx,
+                active_stream: None,
+                pending_delete: None,
+                show_settings: false,
+            }
+        }
+
+        fn active_stream(
+            conversation: Uuid,
+            user_message: Uuid,
+            assistant_message: Uuid,
+        ) -> ActiveStream {
+            ActiveStream {
+                conversation,
+                user_message,
+                assistant_message,
+                cancellation: CancellationToken::new(),
+            }
+        }
 
         #[test]
         fn request_has_no_system_message_by_default() {
@@ -869,6 +1075,183 @@ mod app {
             assert!(
                 (column.center().x - panel.center().x).abs() <= 1.0,
                 "conversation column must remain centred in its usable panel"
+            );
+        }
+
+        #[test]
+        fn deleting_selected_chat_selects_the_next_chat() {
+            let first = conversation("First");
+            let second = conversation("Second");
+            let third = conversation("Third");
+            let mut app = test_app(
+                vec![first.clone(), second.clone(), third.clone()],
+                Some(second.id),
+            );
+
+            app.remove_conversation(second.id);
+
+            assert_eq!(app.state.selected, Some(third.id));
+            assert_eq!(app.state.conversations.len(), 2);
+            assert!(
+                app.state
+                    .conversations
+                    .iter()
+                    .all(|chat| chat.id != second.id)
+            );
+        }
+
+        #[test]
+        fn deleting_the_last_selected_chat_selects_the_previous_chat() {
+            let first = conversation("First");
+            let second = conversation("Second");
+            let mut app = test_app(vec![first.clone(), second.clone()], Some(second.id));
+
+            app.remove_conversation(second.id);
+
+            assert_eq!(app.state.selected, Some(first.id));
+            assert_eq!(app.state.conversations.len(), 1);
+        }
+
+        #[test]
+        fn deleting_final_chat_creates_a_fresh_selected_chat() {
+            let only = conversation("Only");
+            let mut app = test_app(vec![only.clone()], Some(only.id));
+
+            app.remove_conversation(only.id);
+
+            assert_eq!(app.state.conversations.len(), 1);
+            assert_eq!(app.state.selected, Some(app.state.conversations[0].id));
+            assert!(app.state.conversations[0].messages.is_empty());
+            assert_eq!(app.state.conversations[0].title, "New conversation");
+        }
+
+        #[test]
+        fn deleting_an_active_chat_cancels_then_ignores_late_events() {
+            let mut chat = conversation("Active");
+            let user = Uuid::new_v4();
+            let assistant = Uuid::new_v4();
+            chat.messages = vec![
+                Message {
+                    id: user,
+                    role: Role::User,
+                    content: "hello".into(),
+                },
+                Message {
+                    id: assistant,
+                    role: Role::Assistant,
+                    content: String::new(),
+                },
+            ];
+            let mut app = test_app(vec![chat.clone()], Some(chat.id));
+            app.active_stream = Some(active_stream(chat.id, user, assistant));
+            let cancellation = app
+                .active_stream
+                .as_ref()
+                .expect("stream is active")
+                .cancellation
+                .clone();
+
+            app.remove_conversation(chat.id);
+            assert!(cancellation.is_cancelled());
+            assert!(app.active_stream.is_some(), "terminal event owns cleanup");
+
+            app.event_tx
+                .send(Event::Delta {
+                    conversation: chat.id,
+                    message: assistant,
+                    text: "late output".into(),
+                })
+                .unwrap();
+            app.event_tx
+                .send(Event::Cancelled {
+                    conversation: chat.id,
+                })
+                .unwrap();
+            app.process_events();
+
+            assert!(app.active_stream.is_none());
+            assert_eq!(app.status, "Generation cancelled");
+            assert!(
+                app.state
+                    .conversations
+                    .iter()
+                    .all(|conversation| conversation.id != chat.id)
+            );
+        }
+
+        #[test]
+        fn clearing_or_deleting_the_active_message_cancels_generation() {
+            let mut chat = conversation("Active");
+            let user = Uuid::new_v4();
+            let assistant = Uuid::new_v4();
+            chat.messages = vec![
+                Message {
+                    id: user,
+                    role: Role::User,
+                    content: "hello".into(),
+                },
+                Message {
+                    id: assistant,
+                    role: Role::Assistant,
+                    content: String::new(),
+                },
+            ];
+            let mut app = test_app(vec![chat.clone()], Some(chat.id));
+            app.active_stream = Some(active_stream(chat.id, user, assistant));
+            let cancellation = app
+                .active_stream
+                .as_ref()
+                .expect("stream is active")
+                .cancellation
+                .clone();
+
+            app.remove_selected_message(assistant);
+            assert!(cancellation.is_cancelled());
+
+            let mut app = test_app(vec![chat.clone()], Some(chat.id));
+            app.active_stream = Some(active_stream(chat.id, user, assistant));
+            let cancellation = app
+                .active_stream
+                .as_ref()
+                .expect("stream is active")
+                .cancellation
+                .clone();
+            app.clear_selected_conversation();
+            assert!(cancellation.is_cancelled());
+            assert!(app.selected().expect("selected chat").messages.is_empty());
+        }
+
+        #[test]
+        fn sidebar_delete_control_requires_confirmation() {
+            use egui_kittest::kittest::Queryable;
+
+            let chat = conversation("Delete me");
+            let state = SavedState {
+                settings: Settings::default(),
+                selected: Some(chat.id),
+                conversations: vec![chat.clone()],
+            };
+            let mut harness =
+                egui_kittest::Harness::new_eframe(|cc| HarnessApp::for_test(cc, state));
+
+            harness.get_by_label("Delete chat: Delete me").click();
+            harness.step();
+            assert_eq!(harness.state().pending_delete, Some(chat.id));
+
+            harness.get_by_label("Cancel").click();
+            harness.step();
+            assert!(harness.state().pending_delete.is_none());
+            assert_eq!(harness.state().state.conversations.len(), 1);
+
+            harness.get_by_label("Delete chat: Delete me").click();
+            harness.step();
+            harness.get_by_label("Delete chat").click();
+            harness.step();
+            assert!(harness.state().pending_delete.is_none());
+            assert_eq!(harness.state().state.conversations.len(), 1);
+            assert_eq!(
+                harness.state().state.conversations[0].title,
+                "New conversation"
             );
         }
     }
