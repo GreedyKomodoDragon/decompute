@@ -1,0 +1,10 @@
+# Foundry's default OpAMP setup is intended for a managed SigNoz deployment.
+# For this local Compose test, run the mounted collector pipeline directly so
+# the forwarded OTLP ports remain available to host processes.
+services:
+  ingester:
+    command:
+      - -c
+      - |
+        /signoz-otel-collector migrate sync check &&
+        /signoz-otel-collector --config=/etc/otel-collector-config.yaml

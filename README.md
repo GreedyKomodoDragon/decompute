@@ -99,6 +99,31 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 The public API is OpenAI Chat Completions-compatible: `POST /v1/chat/completions` and `GET /v1/models`. The coordinator selects a worker and proxies a private request; clients never receive worker addresses. Inspect the internal registry with `curl http://127.0.0.1:8000/workers`.
 
+The optional `X-Decompute-Session-Id` request header accepts a client-generated
+UUID. Repeated requests with the same model and UUID prefer the same eligible
+worker for up to 15 minutes. This is best-effort routing metadata, never a
+correctness requirement. Workers retain local llama.cpp KV state with
+`--session-cache-capacity` (default `1`; `0` disables reuse); entries are
+process-local, ephemeral, LRU-evicted, and idle-expire after 15 minutes. The
+worker also supports `--session-cache-min-tokens` (default `100`),
+`--session-cache-max-bytes` (default `0`, unlimited approximate token-history
+budget), and `--session-cache-slot-wait-secs` (default `30`) for same-session
+serialization. Cache checkpoints are taken at the rendered prompt boundary;
+generated output is never added to the reusable prompt prefix. Cancellation,
+errors, template/tool changes, prefix mismatches, and context overflow discard
+the affected entry.
+Affinity and caching are not encryption, authentication, or confidentiality:
+the coordinator still sees plaintext requests, and privileged local processes
+may inspect worker memory.
+
+Workers can push privacy-safe logs and session-cache counters to an
+OpenTelemetry Collector by setting `OTEL_EXPORTER_OTLP_ENDPOINT` (and
+optionally `OTEL_SERVICE_NAME`). The standard OTLP/HTTP environment variables
+control signal-specific endpoints, headers, and timeout behavior. Cache logs
+contain only event categories and aggregate token counts; they never contain
+session UUIDs, prompt text, or token values. Without an OTLP endpoint, logs
+remain local as usual.
+
 ### Native macOS harness
 
 `just harness` starts a small egui desktop client for Apple Silicon macOS. It connects to an external OpenAI-compatible endpoint—by default `http://127.0.0.1:8000`—so its wire protocol is not coupled to Decompute. Use **Connect / refresh models** to discover the model advertised by the coordinator, select it, then chat with progressive SSE output.
