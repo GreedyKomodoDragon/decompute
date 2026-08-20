@@ -9,10 +9,11 @@ that has not yet been scheduled for implementation.
 ### Worker session-cache hardening and telemetry
 
 The first in-memory implementation now covers minimum-token admission,
-bounded same-session ownership, prompt-boundary checkpoints, approximate byte
-budgets, transactional publication, LRU/TTL lifecycle, and OTLP logs/metrics.
-Future work should benchmark these defaults against real model/context sizes
-and add richer runtime-specific byte accounting where llama.cpp exposes it.
+bounded same-session ownership, prompt-boundary checkpoints, conservative
+full-context KV byte reservations, transactional publication, LRU/TTL
+lifecycle, and OTLP logs/metrics. Future work should benchmark these defaults
+against real model/context sizes and replace the conservative reservation with
+direct runtime accounting if llama.cpp exposes it.
 
 The OTLP path is deliberately opt-in and content-blind. It exports cache
 outcome categories and cumulative counters, never session IDs, prompts, or

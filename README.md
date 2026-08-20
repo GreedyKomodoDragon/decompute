@@ -106,9 +106,10 @@ correctness requirement. Workers retain local llama.cpp KV state with
 `--session-cache-capacity` (default `1`; `0` disables reuse); entries are
 process-local, ephemeral, LRU-evicted, and idle-expire after 15 minutes. The
 worker also supports `--session-cache-min-tokens` (default `100`),
-`--session-cache-max-bytes` (default `0`, unlimited approximate token-history
-budget), and `--session-cache-slot-wait-secs` (default `30`) for same-session
-serialization. Cache checkpoints are taken at the rendered prompt boundary;
+`--session-cache-max-bytes` (default `0`, unlimited; non-zero values reserve a
+conservative full-context KV estimate per cached entry), and
+`--session-cache-slot-wait-secs` (default `30`) for same-session serialization.
+Cache checkpoints are taken at the rendered prompt boundary;
 generated output is never added to the reusable prompt prefix. Cancellation,
 errors, template/tool changes, prefix mismatches, and context overflow discard
 the affected entry.

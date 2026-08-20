@@ -43,6 +43,11 @@ look for service `decompute-worker-a`. Cache counters use these metric names:
 - `decompute.session_cache.expirations`
 - `decompute.session_cache.invalidations`
 
+When `--session-cache-capacity 0` is used, workers bypass both KV retention and
+same-session serialization. A non-zero `--session-cache-max-bytes` reserves a
+conservative estimate for each full-context KV allocation; it is intentionally
+overestimated to avoid admitting more cached contexts than the budget allows.
+
 For a second worker, use a different service name and port as usual. The
 workers send telemetry directly to the forwarded host OTLP port; no
 coordinator routing is involved.
