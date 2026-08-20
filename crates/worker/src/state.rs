@@ -107,7 +107,7 @@ impl SessionLeases {
         timeout: Duration,
     ) -> Option<SessionLease> {
         let session_id = session_id?;
-        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
         loop {
             let notification = self.changed.notified();
             {
@@ -125,7 +125,7 @@ impl SessionLeases {
             if timeout.is_zero() {
                 return None;
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() || tokio::time::timeout(remaining, notification).await.is_err() {
                 return None;
             }
@@ -145,6 +145,7 @@ pub struct WorkerRuntime {
     acceleration: Acceleration,
     requests: RequestControls,
     session_leases: Arc<SessionLeases>,
+    session_cache_enabled: bool,
     session_slot_wait_timeout: Duration,
 }
 
@@ -172,6 +173,7 @@ impl WorkerRuntime {
             acceleration,
             requests: RequestControls::default(),
             session_leases: Arc::new(SessionLeases::default()),
+            session_cache_enabled: session_cache.max_entries > 0,
             session_slot_wait_timeout: session_cache.slot_wait_timeout(),
         }
     }
@@ -250,20 +252,24 @@ impl WorkerRuntime {
         cancellation: CancellationToken,
     ) -> Result<GenerateResponse> {
         tracing::info!(request_id = %request.request_id, model = %request.model, "starting local inference request");
-        let lease = self
-            .session_leases
-            .acquire(request.session_id, self.session_slot_wait_timeout)
-            .await;
-        let cache_session_id = if request.session_id.is_some() && lease.is_none() {
-            tracing::debug!(
-                cache = "miss",
-                reason = "contended",
-                "session cache lease timed out; using isolated inference"
-            );
-            None
+        let lease = if self.session_cache_enabled {
+            self.session_leases
+                .acquire(request.session_id, self.session_slot_wait_timeout)
+                .await
         } else {
-            request.session_id
+            None
         };
+        let cache_session_id =
+            if self.session_cache_enabled && request.session_id.is_some() && lease.is_none() {
+                tracing::debug!(
+                    cache = "miss",
+                    reason = "contended",
+                    "session cache lease timed out; using isolated inference"
+                );
+                None
+            } else {
+                request.session_id
+            };
         let generated = self
             .model
             .generate(Self::chat_request(
@@ -291,20 +297,24 @@ impl WorkerRuntime {
         cancellation: CancellationToken,
     ) {
         tracing::info!(request_id = %request.request_id, model = %request.model, "starting streamed local inference request");
-        let lease = self
-            .session_leases
-            .acquire(request.session_id, self.session_slot_wait_timeout)
-            .await;
-        let cache_session_id = if request.session_id.is_some() && lease.is_none() {
-            tracing::debug!(
-                cache = "miss",
-                reason = "contended",
-                "session cache lease timed out; using isolated inference"
-            );
-            None
+        let lease = if self.session_cache_enabled {
+            self.session_leases
+                .acquire(request.session_id, self.session_slot_wait_timeout)
+                .await
         } else {
-            request.session_id
+            None
         };
+        let cache_session_id =
+            if self.session_cache_enabled && request.session_id.is_some() && lease.is_none() {
+                tracing::debug!(
+                    cache = "miss",
+                    reason = "contended",
+                    "session cache lease timed out; using isolated inference"
+                );
+                None
+            } else {
+                request.session_id
+            };
         let request_id = request.request_id;
         let chat_request =
             match Self::chat_request(&request, cancellation.clone(), cache_session_id) {

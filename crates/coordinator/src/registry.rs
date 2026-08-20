@@ -186,13 +186,13 @@ mod tests {
         Acceleration, HardwareInfo, ModelCapability, ModelStatus, RegisterWorkerRequest,
         WorkerCapabilities,
     };
-    fn registration() -> RegisterWorkerRequest {
+    fn registration(id: &str, model: &str) -> RegisterWorkerRequest {
         RegisterWorkerRequest {
             address: "http://worker".into(),
             capabilities: WorkerCapabilities {
-                node_id: "a".into(),
+                node_id: id.into(),
                 models: vec![ModelCapability {
-                    id: "tiny-model".into(),
+                    id: model.into(),
                     status: ModelStatus::Loaded,
                     manifest_sha256: None,
                 }],
@@ -211,7 +211,7 @@ mod tests {
     #[tokio::test]
     async fn expiration_marks_worker_offline() {
         let registry = Registry::default();
-        registry.register(registration()).await;
+        registry.register(registration("a", "tiny-model")).await;
         registry
             .expire_at(
                 Instant::now() + Duration::from_secs(16),
@@ -219,5 +219,68 @@ mod tests {
             )
             .await;
         assert_eq!(registry.list().await[0].state, WorkerState::Offline);
+    }
+
+    #[tokio::test]
+    async fn affinity_prefers_bound_worker_and_rebinds_when_busy() {
+        let registry = Registry::default();
+        registry.register(registration("a", "tiny-model")).await;
+        registry.register(registration("b", "tiny-model")).await;
+        let session = Uuid::new_v4();
+
+        let first = registry
+            .select_and_reserve("tiny-model", Some(session))
+            .await
+            .unwrap();
+        assert_eq!(first.id, "a");
+
+        let second = registry
+            .select_and_reserve("tiny-model", Some(session))
+            .await
+            .unwrap();
+        assert_eq!(second.id, "b");
+        assert_eq!(
+            registry.affinity.read().await[&(session, "tiny-model".into())].worker_id,
+            "b"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_worker_binding_is_removed_and_falls_back() {
+        let registry = Registry::default();
+        registry.register(registration("a", "tiny-model")).await;
+        registry.register(registration("b", "tiny-model")).await;
+        let session = Uuid::new_v4();
+
+        let first = registry
+            .select_and_reserve("tiny-model", Some(session))
+            .await
+            .unwrap();
+        registry.release(&first.id).await;
+        registry.mark_offline(&first.id).await;
+
+        let fallback = registry
+            .select_and_reserve("tiny-model", Some(session))
+            .await
+            .unwrap();
+        assert_eq!(fallback.id, "b");
+        assert_eq!(
+            registry.affinity.read().await[&(session, "tiny-model".into())].worker_id,
+            "b"
+        );
+    }
+
+    #[tokio::test]
+    async fn affinity_requires_the_bound_model() {
+        let registry = Registry::default();
+        registry.register(registration("a", "other-model")).await;
+        registry.register(registration("b", "tiny-model")).await;
+        let session = Uuid::new_v4();
+
+        let selected = registry
+            .select_and_reserve("tiny-model", Some(session))
+            .await
+            .unwrap();
+        assert_eq!(selected.id, "b");
     }
 }
