@@ -425,6 +425,16 @@ fn openai_error(status: StatusCode, error: ErrorResponse) -> (StatusCode, Json<E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, routing::post};
+    use protocol::{
+        Acceleration, HardwareInfo, ModelCapability, ModelStatus, RegisterWorkerRequest,
+        WorkerCapabilities, WorkerState,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use tokio::net::TcpListener;
 
     #[test]
     fn parses_worker_sse_frames_split_across_chunks() {
@@ -436,5 +446,69 @@ mod tests {
             sse_data(&bytes[..end]).unwrap().as_deref(),
             Some(r#"{"type":"text_delta","text":"hi"}"#)
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_reaches_the_worker_and_releases_its_reservation() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let worker = Router::new().route(
+            "/requests/{id}/cancel",
+            post(move || {
+                let worker_cancelled = worker_cancelled.clone();
+                async move {
+                    worker_cancelled.store(true, Ordering::Release);
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, worker).await.unwrap();
+        });
+
+        let registry = Registry::default();
+        registry
+            .register(RegisterWorkerRequest {
+                address,
+                capabilities: WorkerCapabilities {
+                    node_id: "worker-a".into(),
+                    models: vec![ModelCapability {
+                        id: "tiny-model".into(),
+                        status: ModelStatus::Loaded,
+                        manifest_sha256: None,
+                    }],
+                    active_requests: 0,
+                    max_requests: 1,
+                    state: WorkerState::Available,
+                    hardware: HardwareInfo {
+                        architecture: "arm64".into(),
+                        total_memory_bytes: 1,
+                        available_memory_bytes: 1,
+                        acceleration: Acceleration::Metal,
+                    },
+                },
+            })
+            .await;
+        let selected = registry
+            .select_and_reserve("tiny-model")
+            .await
+            .expect("worker is eligible");
+        let cancellation = CancellationToken::new();
+
+        cancel_and_release(
+            &registry,
+            &selected,
+            uuid::Uuid::new_v4(),
+            cancellation.clone(),
+        )
+        .await;
+
+        assert!(cancellation.is_cancelled());
+        assert!(cancelled.load(Ordering::Acquire));
+        let worker = registry.list().await.pop().expect("registered worker");
+        assert_eq!(worker.active_requests, 0);
+        assert_eq!(worker.state, WorkerState::Available);
     }
 }

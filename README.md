@@ -105,7 +105,9 @@ The public API is OpenAI Chat Completions-compatible: `POST /v1/chat/completions
 
 The harness sends no hidden system message. Its **System harness** editor is disabled and empty by default; enabling it adds exactly the visible text as the leading `system` message. It never executes tools.
 
-Chats and settings persist locally. The context indicator is intentionally only an estimate (characters divided by four), because a generic OpenAI-compatible model listing does not expose tokenizer or context metadata. The harness never silently drops or summarizes history: remove messages or clear a chat yourself when the estimate exceeds the editable context budget. Press **Stop** to abandon a stream; the coordinator then cancels the corresponding worker generation.
+Chats and settings persist locally. Delete a chat from its sidebar row; Decompute asks for confirmation, and deleting an active chat stops its generation before removing the local history. The context indicator is intentionally only an estimate (characters divided by four), because a generic OpenAI-compatible model listing does not expose tokenizer or context metadata. The harness never silently drops or summarizes history: remove messages or clear a chat yourself when the estimate exceeds the editable context budget. Press **Stop** to abandon a stream; the coordinator then cancels the corresponding worker generation.
+
+The Harness has interaction tests for its accessible controls. Run them with `cargo test -p harness`.
 
 Each worker checks its Hugging Face cache, downloads the pinned file if necessary, verifies its SHA-256, then starts inference. Workers load exactly one selected model, and share the cache safely. To test multi-model discovery instead of same-model scheduling, run `just worker-b-1-5b` in place of `just worker-b`.
 
