@@ -2,6 +2,12 @@
 name = "decompute-llama"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "GGUF and llama.cpp runtime building blocks for the Decompute SDK"
+keywords = ["decompute", "llama", "gguf", "llm"]
+categories = ["api-bindings", "multimedia::images"]
 
 [features]
 default = []
@@ -10,7 +16,7 @@ metal = ["runtime", "llama-cpp-2/metal"]
 
 [dependencies]
 anyhow.workspace = true
-decompute-core = { path = "../decompute-core" }
+decompute-core.workspace = true
 encoding_rs.workspace = true
 llama-cpp-2 = { workspace = true, optional = true }
 llama-cpp-sys-2 = { workspace = true, optional = true }

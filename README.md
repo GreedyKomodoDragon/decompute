@@ -50,6 +50,37 @@ Use `llama-metal` instead of `llama` to compile llama.cpp with Metal support. Th
 
 The process boundary is deliberate: moving a worker to another machine only changes its bind/advertise address; neither the coordinator nor protocol needs to know how the model is executed.
 
+### Publishing the embedded SDK
+
+The publishable embedded SDK is released as three aligned crates:
+`decompute-core`, `decompute-llama`, and `decompute-sdk`. Applications normally
+depend only on `decompute-sdk`; the other two are resolved transitively.
+
+Releases use one workspace version and a matching annotated Git tag:
+
+```text
+workspace version: 0.2.0
+Git tag:           v0.2.0
+crates.io crates:  0.2.0
+```
+
+Update the workspace version, run the normal checks, commit the release, and
+push the tag:
+
+```bash
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+git commit -am "Release v0.2.0"
+git tag -a v0.2.0 -m "Release v0.2.0"
+git push origin main v0.2.0
+```
+
+The tag workflow verifies that the tag matches every publishable package,
+then publishes in dependency order. Configure the repository secret
+`CRATES_IO_TOKEN` before using it. Git tags do not change Cargo versions by
+themselves; the workflow intentionally fails if the tag and workspace version
+are different.
+
 ## Prerequisites
 
 - Apple Silicon macOS with Metal. This prototype's supported local platform is macOS/Metal only.
