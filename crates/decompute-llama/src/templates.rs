@@ -130,7 +130,7 @@ fn load_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use decompute_core::{ChatRole, FunctionDefinition, ToolType};
+    use decompute_core::{ChatRole, FunctionCall, FunctionDefinition, ToolCall, ToolType};
 
     #[test]
     fn qwen_tool_template_renders_tool_schema() {
@@ -157,6 +157,68 @@ mod tests {
         assert!(output.contains("<tools>"));
         assert!(output.contains("get_time"));
         assert!(output.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn qwen_tool_template_preserves_tool_result_order() {
+        let registry = TemplateRegistry::load(Path::new("qwen.gguf"), "qwen2").unwrap();
+        let output = registry
+            .render(
+                "qwen-tools",
+                &[
+                    ChatMessage {
+                        role: ChatRole::User,
+                        content: "Use both tools".into(),
+                        tool_calls: vec![],
+                        tool_call_id: None,
+                    },
+                    ChatMessage {
+                        role: ChatRole::Assistant,
+                        content: String::new(),
+                        tool_calls: vec![
+                            ToolCall {
+                                id: "call-1".into(),
+                                kind: ToolType::Function,
+                                function: FunctionCall {
+                                    name: "get_time".into(),
+                                    arguments: serde_json::json!({}),
+                                },
+                            },
+                            ToolCall {
+                                id: "call-2".into(),
+                                kind: ToolType::Function,
+                                function: FunctionCall {
+                                    name: "get_time".into(),
+                                    arguments: serde_json::json!({"timezone": "UTC"}),
+                                },
+                            },
+                        ],
+                        tool_call_id: None,
+                    },
+                    ChatMessage {
+                        role: ChatRole::Tool,
+                        content: "first-result".into(),
+                        tool_calls: vec![],
+                        tool_call_id: Some("call-1".into()),
+                    },
+                    ChatMessage {
+                        role: ChatRole::Tool,
+                        content: "second-result".into(),
+                        tool_calls: vec![],
+                        tool_call_id: Some("call-2".into()),
+                    },
+                ],
+                &[ToolDefinition {
+                    kind: ToolType::Function,
+                    function: FunctionDefinition {
+                        name: "get_time".into(),
+                        description: None,
+                        parameters: serde_json::json!({"type":"object"}),
+                    },
+                }],
+            )
+            .unwrap();
+        assert!(output.find("first-result").unwrap() < output.find("second-result").unwrap());
     }
 
     #[test]

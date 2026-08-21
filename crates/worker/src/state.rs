@@ -278,6 +278,12 @@ impl WorkerRuntime {
                 cache_session_id,
             )?)
             .await?;
+        tracing::debug!(
+            request_id = %request.request_id,
+            tool_calls = generated.tool_calls.len(),
+            finish_reason = ?generated.finish_reason,
+            "completed local inference request"
+        );
         Ok(GenerateResponse {
             request_id: request.request_id,
             worker_id: self.node_id.clone(),
@@ -343,7 +349,13 @@ impl WorkerRuntime {
             let event = match event {
                 GenerationEvent::TextDelta(text) => GenerationStreamEvent::TextDelta { text },
                 GenerationEvent::Completed(result) => {
-                    tracing::info!(request_id = %request_id, output_tokens = result.output_tokens, "completed streamed local inference request");
+                    tracing::debug!(
+                        request_id = %request_id,
+                        output_tokens = result.output_tokens,
+                        tool_calls = result.tool_calls.len(),
+                        finish_reason = ?result.finish_reason,
+                        "completed streamed local inference request"
+                    );
                     GenerationStreamEvent::Completed {
                         input_tokens: result.input_tokens,
                         output_tokens: result.output_tokens,

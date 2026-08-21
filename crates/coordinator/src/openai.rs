@@ -1,6 +1,6 @@
 use protocol::{
     ChatMessage, ChatRole, FinishReason, FunctionCall, GenerateRequest, GenerateResponse, ToolCall,
-    ToolDefinition, ToolType, validate_tools,
+    ToolDefinition, ToolType, validate_tool_history, validate_tools,
 };
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -83,6 +83,11 @@ impl TryFrom<ChatCompletionRequest> for GenerateRequest {
             .into_iter()
             .map(ChatMessage::try_from)
             .collect::<Result<Vec<_>, _>>()?;
+        validate_tool_history(&messages, &request.tools).map_err(|error| {
+            RequestError::Validation(protocol::RequestValidationError::InvalidToolHistory(
+                error.to_string(),
+            ))
+        })?;
         Ok(GenerateRequest {
             request_id: Uuid::new_v4(),
             session_id: None,
@@ -467,6 +472,30 @@ mod tests {
                 .arguments["timezone"],
             "UTC"
         );
+    }
+
+    #[test]
+    fn rejects_out_of_order_openai_tool_history() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "tiny-model",
+            "messages": [
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"call-1","type":"function","function":{"name":"first","arguments":"{}"}},
+                    {"id":"call-2","type":"function","function":{"name":"second","arguments":"{}"}}
+                ]},
+                {"role":"tool","tool_call_id":"call-2","content":"second"},
+                {"role":"tool","tool_call_id":"call-1","content":"first"}
+            ],
+            "tools": [
+                {"type":"function","function":{"name":"first","parameters":{"type":"object"}}},
+                {"type":"function","function":{"name":"second","parameters":{"type":"object"}}}
+            ]
+        }))
+        .unwrap();
+        assert!(matches!(
+            GenerateRequest::try_from(request),
+            Err(RequestError::Validation(_))
+        ));
     }
 
     #[test]
