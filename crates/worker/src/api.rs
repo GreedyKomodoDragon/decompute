@@ -121,5 +121,8 @@ fn normalize_request(request: &mut GenerateRequest) -> Result<(), String> {
         .map_err(|err| err.to_string())?;
     request.prompt = None;
     request.messages = Some(messages);
+    request
+        .validate_tool_history_messages(request.messages.as_deref().unwrap_or_default())
+        .map_err(|err| err.to_string())?;
     Ok(())
 }

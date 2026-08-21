@@ -1,4 +1,4 @@
-use crate::{ChatMessage, ChatRole, FinishReason, ToolCall, ToolDefinition};
+use crate::{ChatMessage, ChatRole, FinishReason, ToolCall, ToolDefinition, validate_tool_history};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -27,6 +27,19 @@ impl GenerateRequest {
     pub fn validate_tools(&self) -> Result<(), RequestValidationError> {
         validate_tools(&self.tools)
     }
+
+    pub fn validate_tool_history(&self) -> Result<(), RequestValidationError> {
+        let messages = self.normalized_messages()?;
+        self.validate_tool_history_messages(&messages)
+    }
+
+    pub fn validate_tool_history_messages(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<(), RequestValidationError> {
+        validate_tool_history(messages, &self.tools)
+            .map_err(|error| RequestValidationError::InvalidToolHistory(error.to_string()))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -54,6 +67,8 @@ pub enum RequestValidationError {
     DuplicateToolName,
     #[error("tool parameters must be a JSON object")]
     InvalidToolParameters,
+    #[error("invalid tool history: {0}")]
+    InvalidToolHistory(String),
 }
 
 pub fn validate_tools(tools: &[ToolDefinition]) -> Result<(), RequestValidationError> {
@@ -168,5 +183,28 @@ mod tests {
             validate_tools(&[tool.clone(), tool]).unwrap_err(),
             RequestValidationError::DuplicateToolName
         );
+    }
+
+    #[test]
+    fn validates_tool_history_before_worker_inference() {
+        let request = GenerateRequest {
+            request_id: Uuid::nil(),
+            session_id: None,
+            model: "model".into(),
+            prompt: None,
+            messages: Some(vec![ChatMessage {
+                role: ChatRole::Tool,
+                content: "result".into(),
+                tool_calls: vec![],
+                tool_call_id: Some("unknown".into()),
+            }]),
+            template: None,
+            tools: vec![],
+            max_tokens: 8,
+        };
+        assert!(matches!(
+            request.validate_tool_history(),
+            Err(RequestValidationError::InvalidToolHistory(_))
+        ));
     }
 }

@@ -187,7 +187,7 @@ For safety, templates are loaded only once from the model-local override directo
 
 ### Tool-call proposals
 
-The HTTP API accepts OpenAI-style tool definitions and tool-history messages. For Qwen GGUF models, the worker selects its built-in Qwen tool template, renders the supplied schemas, parses `<tool_call>` JSON blocks, and returns standard OpenAI tool calls. Neither component executes a tool.
+The HTTP API accepts OpenAI-style tool definitions and tool-history messages. For Qwen GGUF models, the worker selects its built-in Qwen tool template, renders the supplied schemas, parses `<tool_call>` JSON blocks, and returns standard OpenAI tool calls. The worker validates that every submitted tool result matches a preceding assistant call, but neither the coordinator nor worker executes a tool.
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -211,7 +211,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-The client owns the execution loop: validate and execute each proposed call in its own trusted environment, then submit an assistant tool-call message and one `tool` message per result. The worker renders the tool history back into Qwen's expected format. For another model family, add a model-aware template and parser without changing the coordinator protocol.
+The client owns the execution loop: validate and execute each proposed call in its own trusted environment, then submit an assistant tool-call message and one `tool` message per result, in the same order as the assistant's calls. The coordinator and worker reject missing, duplicate, undeclared, out-of-order, or unmatched call IDs before inference, then render the valid tool history back into Qwen's expected format. For another model family, add a model-aware template and parser without changing the coordinator protocol.
 
 ### OpenCode
 

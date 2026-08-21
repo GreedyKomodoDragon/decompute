@@ -16,18 +16,18 @@ pub fn parse_tool_calls(
     let mut visible = String::new();
     let mut remainder = text;
     let mut calls = Vec::new();
+    let mut ids = HashSet::new();
     while let Some(start) = remainder.find("<tool_call>") {
         visible.push_str(&remainder[..start]);
         let body = &remainder[start + "<tool_call>".len()..];
         let Some(end) = body.find("</tool_call>") else {
             bail!("unterminated Qwen <tool_call> block");
         };
-        calls.push(parse_one(
-            body[..end].trim(),
-            &names,
-            request_id,
-            calls.len(),
-        )?);
+        let call = parse_one(body[..end].trim(), &names, request_id, calls.len())?;
+        if !ids.insert(call.id.clone()) {
+            bail!("model returned duplicate tool-call id {:?}", call.id);
+        }
+        calls.push(call);
         remainder = &body[end + "</tool_call>".len()..];
     }
     visible.push_str(remainder);
@@ -62,12 +62,16 @@ fn parse_one(
     if !arguments.is_object() {
         bail!("tool call {name:?} arguments must be a JSON object");
     }
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{request_id}-{index}"));
+    if id.is_empty() {
+        bail!("tool call id must not be empty");
+    }
     Ok(ToolCall {
-        id: value
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("{request_id}-{index}")),
+        id,
         kind: ToolType::Function,
         function: FunctionCall {
             name: name.to_owned(),
@@ -99,5 +103,37 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_time");
         assert_eq!(calls[0].function.arguments["timezone"], "UTC");
+    }
+
+    #[test]
+    fn extracts_multiple_calls_and_preserves_visible_text() {
+        let output = concat!(
+            "before\n",
+            "<tool_call>{\"name\":\"get_time\",\"arguments\":{}}</tool_call>\n",
+            "between\n",
+            "<tool_call>{\"name\":\"get_time\",\"arguments\":{\"tz\":\"UTC\"}}</tool_call>\n",
+            "after"
+        );
+        let (text, calls) = parse_tool_calls(output, &tools(), Uuid::nil()).unwrap();
+        assert_eq!(text, "before\n\nbetween\n\nafter");
+        assert_eq!(calls.len(), 2);
+        assert_ne!(calls[0].id, calls[1].id);
+    }
+
+    #[test]
+    fn accepts_string_encoded_arguments() {
+        let output =
+            r#"<tool_call>{"name":"get_time","arguments":"{\"timezone\":\"UTC\"}"}</tool_call>"#;
+        let (_, calls) = parse_tool_calls(output, &tools(), Uuid::nil()).unwrap();
+        assert_eq!(calls[0].function.arguments["timezone"], "UTC");
+    }
+
+    #[test]
+    fn rejects_duplicate_explicit_ids() {
+        let output = concat!(
+            r#"<tool_call>{"id":"same","name":"get_time","arguments":{}}</tool_call>"#,
+            r#"<tool_call>{"id":"same","name":"get_time","arguments":{}}</tool_call>"#
+        );
+        assert!(parse_tool_calls(output, &tools(), Uuid::nil()).is_err());
     }
 }
