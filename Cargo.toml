@@ -17,8 +17,12 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+repository = "https://github.com/GreedyKomodoDragon/decompute"
 
 [workspace.dependencies]
+decompute-core = { version = "0.1.0", path = "crates/decompute-core" }
+decompute-llama = { version = "0.1.0", path = "crates/decompute-llama" }
+
 anyhow = "1"
 async-stream = "0.3"
 axum = "0.8"

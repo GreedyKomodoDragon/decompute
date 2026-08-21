@@ -2,6 +2,12 @@
 name = "decompute-sdk"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Async embedded GGUF inference SDK for Decompute applications"
+keywords = ["decompute", "llm", "llama", "gguf", "inference"]
+categories = ["api-bindings", "asynchronous"]
 
 [features]
 default = []
@@ -10,8 +16,8 @@ llama-metal = ["llama", "decompute-llama/metal"]
 
 [dependencies]
 anyhow.workspace = true
-decompute-core = { path = "../decompute-core" }
-decompute-llama = { path = "../decompute-llama", optional = true, features = ["runtime"] }
+decompute-core.workspace = true
+decompute-llama = { workspace = true, optional = true, features = ["runtime"] }
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true

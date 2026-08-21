@@ -1,0 +1,103 @@
+---
+name: Release crates
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+env:
+  PUBLISHABLE_CRATES: "decompute-core decompute-llama decompute-sdk"
+
+jobs:
+  release:
+    name: Verify and publish crates
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Homebrew LLVM
+        run: brew install llvm
+
+      - name: Configure native compiler and SDK
+        run: |
+          echo "CC=$(brew --prefix llvm)/bin/clang" >> "$GITHUB_ENV"
+          echo "CXX=$(brew --prefix llvm)/bin/clang++" >> "$GITHUB_ENV"
+          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+          echo "MACOSX_DEPLOYMENT_TARGET=14.5" >> "$GITHUB_ENV"
+
+      - name: Verify tag matches workspace and crate versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          workspace_version="$(
+            cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg crate decompute-core \
+                '.packages[] | select(.name == $crate) | .version'
+          )"
+
+          test "$tag_version" = "$workspace_version" || {
+            echo "Tag v$tag_version does not match workspace version"
+            echo "$workspace_version"
+            exit 1
+          }
+
+          for crate in $PUBLISHABLE_CRATES; do
+            crate_version="$(cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg crate "$crate" \
+                '.packages[] | select(.name == $crate) | .version')"
+            test "$crate_version" = "$tag_version" || {
+              echo "$crate is version $crate_version, expected $tag_version"
+              exit 1
+            }
+          done
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint workspace
+        run: >-
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+      - name: Configure crates.io credentials
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          test -n "${CARGO_REGISTRY_TOKEN:-}" || {
+            echo "CRATES_IO_TOKEN is not configured"
+            exit 1
+          }
+
+      - name: Package and publish decompute-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          cargo publish -p decompute-core --dry-run \
+            --token "$CARGO_REGISTRY_TOKEN"
+          cargo publish -p decompute-core --token "$CARGO_REGISTRY_TOKEN"
+
+      - name: Package and publish dependent crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for crate in decompute-llama decompute-sdk; do
+            for attempt in 1 2 3; do
+              if cargo publish -p "$crate" --dry-run \
+                --token "$CARGO_REGISTRY_TOKEN" && \
+                 cargo publish -p "$crate" --token "$CARGO_REGISTRY_TOKEN"; then
+                break
+              fi
+              test "$attempt" -lt 3 || exit 1
+              echo "Registry propagation delay; retrying $crate"
+              sleep 20
+            done
+          done

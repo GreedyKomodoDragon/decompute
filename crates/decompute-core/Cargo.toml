@@ -2,6 +2,12 @@
 name = "decompute-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Transport-neutral chat, tool-call, model, and generation types for Decompute"
+keywords = ["decompute", "llm", "chat", "tools"]
+categories = ["api-bindings", "data-structures"]
 
 [dependencies]
 serde.workspace = true
