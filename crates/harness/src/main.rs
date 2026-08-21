@@ -852,7 +852,7 @@ mod app {
         let client = reqwest::Client::new();
         let response = tokio::select! {
             _ = cancel.cancelled() => { let _ = tx.send(Event::Cancelled { conversation }); return; }
-            response = client.post(format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'))).json(&request).send() => response,
+            response = client.post(format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'))).header("X-Decompute-Session-Id", conversation.to_string()).json(&request).send() => response,
         };
         let response = match response {
             Ok(response) if response.status().is_success() => response,

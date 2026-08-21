@@ -6,6 +6,7 @@ use uuid::Uuid;
 #[derive(Clone, Debug)]
 pub struct ChatRequest {
     pub request_id: Uuid,
+    pub session_id: Option<Uuid>,
     pub messages: Vec<ChatMessage>,
     /// Reserved for a future named-template registry. GGUF models currently
     /// use the template embedded in their own metadata.

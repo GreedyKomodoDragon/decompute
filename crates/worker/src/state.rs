@@ -1,17 +1,19 @@
 use anyhow::Result;
+use decompute_core::SessionCacheConfig;
 use decompute_sdk::{ChatRequest, GenerationConfig, GenerationEvent, GgufModelHandle};
 use protocol::{
     Acceleration, GenerateRequest, GenerateResponse, GenerationStreamEvent, ModelCapability,
     ModelManifest, ModelStatus, WorkerCapabilities, WorkerState,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -73,6 +75,64 @@ impl RequestControls {
     }
 }
 
+#[derive(Default)]
+struct SessionLeases {
+    active: Mutex<HashSet<Uuid>>,
+    changed: Notify,
+}
+
+struct SessionLease {
+    session_id: Uuid,
+    leases: Arc<SessionLeases>,
+}
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        if self
+            .leases
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.session_id)
+        {
+            self.leases.changed.notify_waiters();
+        }
+    }
+}
+
+impl SessionLeases {
+    async fn acquire(
+        self: &Arc<Self>,
+        session_id: Option<Uuid>,
+        timeout: Duration,
+    ) -> Option<SessionLease> {
+        let session_id = session_id?;
+        let started = Instant::now();
+        loop {
+            let notification = self.changed.notified();
+            {
+                let mut active = self
+                    .active
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if active.insert(session_id) {
+                    return Some(SessionLease {
+                        session_id,
+                        leases: self.clone(),
+                    });
+                }
+            }
+            if timeout.is_zero() {
+                return None;
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() || tokio::time::timeout(remaining, notification).await.is_err() {
+                return None;
+            }
+        }
+    }
+}
+
 pub struct WorkerRuntime {
     pub node_id: String,
     pub model_id: String,
@@ -84,9 +144,13 @@ pub struct WorkerRuntime {
     model: GgufModelHandle,
     acceleration: Acceleration,
     requests: RequestControls,
+    session_leases: Arc<SessionLeases>,
+    session_cache_enabled: bool,
+    session_slot_wait_timeout: Duration,
 }
 
 impl WorkerRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         node_id: String,
         model_id: String,
@@ -94,6 +158,7 @@ impl WorkerRuntime {
         max_requests: usize,
         manifest: ModelManifest,
         acceleration: Acceleration,
+        session_cache: SessionCacheConfig,
         model: GgufModelHandle,
     ) -> Self {
         Self {
@@ -107,6 +172,9 @@ impl WorkerRuntime {
             model,
             acceleration,
             requests: RequestControls::default(),
+            session_leases: Arc::new(SessionLeases::default()),
+            session_cache_enabled: session_cache.max_entries > 0,
+            session_slot_wait_timeout: session_cache.slot_wait_timeout(),
         }
     }
 
@@ -184,9 +252,31 @@ impl WorkerRuntime {
         cancellation: CancellationToken,
     ) -> Result<GenerateResponse> {
         tracing::info!(request_id = %request.request_id, model = %request.model, "starting local inference request");
+        let lease = if self.session_cache_enabled {
+            self.session_leases
+                .acquire(request.session_id, self.session_slot_wait_timeout)
+                .await
+        } else {
+            None
+        };
+        let cache_session_id =
+            if self.session_cache_enabled && request.session_id.is_some() && lease.is_none() {
+                tracing::debug!(
+                    cache = "miss",
+                    reason = "contended",
+                    "session cache lease timed out; using isolated inference"
+                );
+                None
+            } else {
+                request.session_id
+            };
         let generated = self
             .model
-            .generate(Self::chat_request(&request, cancellation)?)
+            .generate(Self::chat_request(
+                &request,
+                cancellation,
+                cache_session_id,
+            )?)
             .await?;
         Ok(GenerateResponse {
             request_id: request.request_id,
@@ -207,18 +297,37 @@ impl WorkerRuntime {
         cancellation: CancellationToken,
     ) {
         tracing::info!(request_id = %request.request_id, model = %request.model, "starting streamed local inference request");
-        let request_id = request.request_id;
-        let chat_request = match Self::chat_request(&request, cancellation.clone()) {
-            Ok(request) => request,
-            Err(error) => {
-                let _ = events
-                    .send(GenerationStreamEvent::Error {
-                        message: format!("{error:#}"),
-                    })
-                    .await;
-                return;
-            }
+        let lease = if self.session_cache_enabled {
+            self.session_leases
+                .acquire(request.session_id, self.session_slot_wait_timeout)
+                .await
+        } else {
+            None
         };
+        let cache_session_id =
+            if self.session_cache_enabled && request.session_id.is_some() && lease.is_none() {
+                tracing::debug!(
+                    cache = "miss",
+                    reason = "contended",
+                    "session cache lease timed out; using isolated inference"
+                );
+                None
+            } else {
+                request.session_id
+            };
+        let request_id = request.request_id;
+        let chat_request =
+            match Self::chat_request(&request, cancellation.clone(), cache_session_id) {
+                Ok(request) => request,
+                Err(error) => {
+                    let _ = events
+                        .send(GenerationStreamEvent::Error {
+                            message: format!("{error:#}"),
+                        })
+                        .await;
+                    return;
+                }
+            };
         let mut receiver = match self.model.stream(chat_request).await {
             Ok(receiver) => receiver,
             Err(error) => {
@@ -256,9 +365,11 @@ impl WorkerRuntime {
     fn chat_request(
         request: &GenerateRequest,
         cancellation: CancellationToken,
+        session_id: Option<Uuid>,
     ) -> Result<ChatRequest> {
         Ok(ChatRequest {
             request_id: request.request_id,
+            session_id,
             messages: request.normalized_messages().map_err(anyhow::Error::msg)?,
             template: request.template.clone(),
             tools: request.tools.clone(),
@@ -273,7 +384,8 @@ impl WorkerRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::RequestControls;
+    use super::{RequestControls, SessionLeases};
+    use std::{sync::Arc, time::Duration};
     use uuid::Uuid;
 
     #[tokio::test]
@@ -292,5 +404,21 @@ mod tests {
         controls.finish(id);
         assert!(waiter.await);
         assert!(!controls.cancel(id).await);
+    }
+
+    #[tokio::test]
+    async fn same_session_waits_for_the_previous_request_then_releases() {
+        let leases = Arc::new(SessionLeases::default());
+        let id = Uuid::new_v4();
+        let first = leases.acquire(Some(id), Duration::ZERO).await;
+        assert!(first.is_some());
+        assert!(
+            leases
+                .acquire(Some(id), Duration::from_millis(1))
+                .await
+                .is_none()
+        );
+        drop(first);
+        assert!(leases.acquire(Some(id), Duration::ZERO).await.is_some());
     }
 }

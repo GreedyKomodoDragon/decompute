@@ -93,6 +93,7 @@ impl GgufModelHandle {
     pub async fn smoke_test(&self) -> Result<()> {
         self.generate(ChatRequest {
             request_id: uuid::Uuid::nil(),
+            session_id: None,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: "Reply with one word.".into(),
@@ -121,6 +122,7 @@ fn generate(
         &request.messages,
         &request.tools,
         request.template.as_deref(),
+        request.session_id,
         request.request_id,
         &request.cancellation,
         GgufGenerationConfig {

@@ -1,4 +1,5 @@
 /target/
+/pours/
 /models/*
 !/models/.gitkeep
 .DS_Store

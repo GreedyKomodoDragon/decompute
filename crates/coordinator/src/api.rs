@@ -7,7 +7,7 @@ use crate::{
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -77,12 +77,26 @@ async fn models(State(registry): State<Arc<Registry>>) -> Json<ModelsResponse> {
 
 async fn chat_completions(
     State(registry): State<Arc<Registry>>,
+    headers: HeaderMap,
     Json(public): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
     let wants_stream = public.stream;
     let model = public.model.clone();
+    let session_id = match parse_session_id(&headers) {
+        Ok(session_id) => session_id,
+        Err(message) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                ErrorResponse::invalid_request(message),
+            )
+            .into_response();
+        }
+    };
     let request = match GenerateRequest::try_from(public) {
-        Ok(request) => request,
+        Ok(mut request) => {
+            request.session_id = session_id;
+            request
+        }
         Err(err) => {
             return openai_error(
                 StatusCode::BAD_REQUEST,
@@ -111,7 +125,10 @@ async fn stream_request(
     request: GenerateRequest,
     model: String,
 ) -> Response {
-    let Some(worker) = registry.select_and_reserve(&request.model).await else {
+    let Some(worker) = registry
+        .select_and_reserve(&request.model, request.session_id)
+        .await
+    else {
         return openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorResponse::server_error("no eligible worker has the requested model"),
@@ -318,7 +335,10 @@ async fn route_request(
     request: GenerateRequest,
     cancellation: CancellationToken,
 ) -> Result<GenerateResponse, (StatusCode, String)> {
-    let Some(worker) = registry.select_and_reserve(&request.model).await else {
+    let Some(worker) = registry
+        .select_and_reserve(&request.model, request.session_id)
+        .await
+    else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "no eligible worker has the requested model".into(),
@@ -422,6 +442,18 @@ fn openai_error(status: StatusCode, error: ErrorResponse) -> (StatusCode, Json<E
     (status, Json(error))
 }
 
+fn parse_session_id(headers: &HeaderMap) -> Result<Option<uuid::Uuid>, &'static str> {
+    let Some(value) = headers.get("x-decompute-session-id") else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| "X-Decompute-Session-Id must be a UUID")?;
+    uuid::Uuid::parse_str(value.trim())
+        .map(Some)
+        .map_err(|_| "X-Decompute-Session-Id must be a UUID")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,6 +478,19 @@ mod tests {
             sse_data(&bytes[..end]).unwrap().as_deref(),
             Some(r#"{"type":"text_delta","text":"hi"}"#)
         );
+    }
+
+    #[test]
+    fn accepts_only_uuid_session_headers() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(parse_session_id(&headers).unwrap(), None);
+        headers.insert("x-decompute-session-id", "not-a-session".parse().unwrap());
+        assert!(parse_session_id(&headers).is_err());
+        headers.insert(
+            "x-decompute-session-id",
+            uuid::Uuid::new_v4().to_string().parse().unwrap(),
+        );
+        assert!(parse_session_id(&headers).unwrap().is_some());
     }
 
     #[tokio::test]
@@ -492,7 +537,7 @@ mod tests {
             })
             .await;
         let selected = registry
-            .select_and_reserve("tiny-model")
+            .select_and_reserve("tiny-model", None)
             .await
             .expect("worker is eligible");
         let cancellation = CancellationToken::new();

@@ -4,6 +4,15 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
+use uuid::Uuid;
+
+const AFFINITY_TTL: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Clone, Debug)]
+struct AffinityBinding {
+    worker_id: String,
+    last_used: Instant,
+}
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct WorkerRecord {
@@ -27,6 +36,7 @@ pub struct SelectedWorker {
 #[derive(Default)]
 pub struct Registry {
     workers: RwLock<HashMap<String, WorkerRecord>>,
+    affinity: RwLock<HashMap<(Uuid, String), AffinityBinding>>,
 }
 
 impl Registry {
@@ -78,11 +88,42 @@ impl Registry {
         models.dedup();
         models
     }
-    pub async fn select_and_reserve(&self, model: &str) -> Option<SelectedWorker> {
+    pub async fn select_and_reserve(
+        &self,
+        model: &str,
+        session_id: Option<Uuid>,
+    ) -> Option<SelectedWorker> {
         let mut workers = self.workers.write().await;
-        let id = crate::scheduler::select_worker(workers.values(), model)?
-            .id
-            .clone();
+        let now = Instant::now();
+        let key = session_id.map(|id| (id, model.to_owned()));
+        let preferred = if let Some(key) = key.as_ref() {
+            let affinity = self.affinity.read().await;
+            affinity
+                .get(key)
+                .filter(|binding| now.duration_since(binding.last_used) <= AFFINITY_TTL)
+                .map(|binding| binding.worker_id.clone())
+        } else {
+            None
+        };
+        let id = preferred
+            .filter(|id| {
+                workers
+                    .get(id)
+                    .is_some_and(|worker| eligible(worker, model))
+            })
+            .or_else(|| {
+                crate::scheduler::select_worker(workers.values(), model)
+                    .map(|worker| worker.id.clone())
+            })?;
+        if let Some(key) = key {
+            self.affinity.write().await.insert(
+                key,
+                AffinityBinding {
+                    worker_id: id.clone(),
+                    last_used: now,
+                },
+            );
+        }
         let worker = workers.get_mut(&id)?;
         worker.active_requests += 1;
         if worker.active_requests >= worker.max_requests {
@@ -105,17 +146,37 @@ impl Registry {
         if let Some(worker) = self.workers.write().await.get_mut(id) {
             worker.state = WorkerState::Offline;
         }
+        self.affinity
+            .write()
+            .await
+            .retain(|_, binding| binding.worker_id != id);
     }
     pub async fn expire_stale(&self, timeout: Duration) {
         self.expire_at(Instant::now(), timeout).await;
     }
     async fn expire_at(&self, now: Instant, timeout: Duration) {
-        for worker in self.workers.write().await.values_mut() {
+        let mut workers = self.workers.write().await;
+        for worker in workers.values_mut() {
             if now.duration_since(worker.last_heartbeat) > timeout {
                 worker.state = WorkerState::Offline;
             }
         }
+        self.affinity.write().await.retain(|_, binding| {
+            now.duration_since(binding.last_used) <= AFFINITY_TTL
+                && workers
+                    .get(&binding.worker_id)
+                    .is_some_and(|worker| worker.state != WorkerState::Offline)
+        });
     }
+}
+
+fn eligible(worker: &WorkerRecord, model: &str) -> bool {
+    worker.state == WorkerState::Available
+        && worker.active_requests < worker.max_requests
+        && worker
+            .models
+            .iter()
+            .any(|candidate| candidate.id == model && candidate.status == ModelStatus::Loaded)
 }
 
 #[cfg(test)]
@@ -125,13 +186,13 @@ mod tests {
         Acceleration, HardwareInfo, ModelCapability, ModelStatus, RegisterWorkerRequest,
         WorkerCapabilities,
     };
-    fn registration() -> RegisterWorkerRequest {
+    fn registration(id: &str, model: &str) -> RegisterWorkerRequest {
         RegisterWorkerRequest {
             address: "http://worker".into(),
             capabilities: WorkerCapabilities {
-                node_id: "a".into(),
+                node_id: id.into(),
                 models: vec![ModelCapability {
-                    id: "tiny-model".into(),
+                    id: model.into(),
                     status: ModelStatus::Loaded,
                     manifest_sha256: None,
                 }],
@@ -150,7 +211,7 @@ mod tests {
     #[tokio::test]
     async fn expiration_marks_worker_offline() {
         let registry = Registry::default();
-        registry.register(registration()).await;
+        registry.register(registration("a", "tiny-model")).await;
         registry
             .expire_at(
                 Instant::now() + Duration::from_secs(16),
@@ -158,5 +219,68 @@ mod tests {
             )
             .await;
         assert_eq!(registry.list().await[0].state, WorkerState::Offline);
+    }
+
+    #[tokio::test]
+    async fn affinity_prefers_bound_worker_and_rebinds_when_busy() {
+        let registry = Registry::default();
+        registry.register(registration("a", "tiny-model")).await;
+        registry.register(registration("b", "tiny-model")).await;
+        let session = Uuid::new_v4();
+
+        let first = registry
+            .select_and_reserve("tiny-model", Some(session))
+            .await
+            .unwrap();
+        assert_eq!(first.id, "a");
+
+        let second = registry
+            .select_and_reserve("tiny-model", Some(session))
+            .await
+            .unwrap();
+        assert_eq!(second.id, "b");
+        assert_eq!(
+            registry.affinity.read().await[&(session, "tiny-model".into())].worker_id,
+            "b"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_worker_binding_is_removed_and_falls_back() {
+        let registry = Registry::default();
+        registry.register(registration("a", "tiny-model")).await;
+        registry.register(registration("b", "tiny-model")).await;
+        let session = Uuid::new_v4();
+
+        let first = registry
+            .select_and_reserve("tiny-model", Some(session))
+            .await
+            .unwrap();
+        registry.release(&first.id).await;
+        registry.mark_offline(&first.id).await;
+
+        let fallback = registry
+            .select_and_reserve("tiny-model", Some(session))
+            .await
+            .unwrap();
+        assert_eq!(fallback.id, "b");
+        assert_eq!(
+            registry.affinity.read().await[&(session, "tiny-model".into())].worker_id,
+            "b"
+        );
+    }
+
+    #[tokio::test]
+    async fn affinity_requires_the_bound_model() {
+        let registry = Registry::default();
+        registry.register(registration("a", "other-model")).await;
+        registry.register(registration("b", "tiny-model")).await;
+        let session = Uuid::new_v4();
+
+        let selected = registry
+            .select_and_reserve("tiny-model", Some(session))
+            .await
+            .unwrap();
+        assert_eq!(selected.id, "b");
     }
 }
