@@ -77,7 +77,7 @@ git push origin main v0.2.0
 
 The tag workflow verifies that the tag matches every publishable package,
 then publishes in dependency order. Configure the repository secret
-`CRATES_IO_TOKEN` before using it. Git tags do not change Cargo versions by
+`CARGO_REGISTRY_TOKEN` before using it. Git tags do not change Cargo versions by
 themselves; the workflow intentionally fails if the tag and workspace version
 are different.
 
