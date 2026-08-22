@@ -945,7 +945,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1045,7 +1045,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "coordinator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1263,7 +1263,7 @@ dependencies = [
 
 [[package]]
 name = "decompute-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1272,7 +1272,7 @@ dependencies = [
 
 [[package]]
 name = "decompute-llama"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "decompute-core",
@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "decompute-models"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "decompute-core",
@@ -1306,7 +1306,7 @@ dependencies = [
 
 [[package]]
 name = "decompute-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "decompute-core",
@@ -2087,7 +2087,7 @@ dependencies = [
 
 [[package]]
 name = "harness"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -2500,7 +2500,7 @@ dependencies = [
 
 [[package]]
 name = "inference-example"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "decompute-sdk",
@@ -3759,7 +3759,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "decompute-core",
  "serde",
@@ -6262,7 +6262,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "worker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-stream",
