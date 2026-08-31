@@ -30,6 +30,7 @@ encoding_rs = "0.8"
 eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "persistence", "wgpu"] }
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
+fs2 = "0.4"
 llama-cpp-2 = { version = "0.1.154", default-features = false }
 llama-cpp-sys-2 = "0.1.154"
 minijinja = { version = "2", features = ["json"] }
