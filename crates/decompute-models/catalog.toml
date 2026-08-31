@@ -5,6 +5,9 @@
 [[models]]
 id = "qwen2.5-0.5b-instruct-q4-k-m"
 display_name = "Qwen2.5 0.5B Instruct Q4_K_M"
+description = "Fastest supported option with the lowest memory and disk requirements."
+download_size_bytes = 491000000
+recommended = false
 format = "gguf"
 repository = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
 revision = "872f8a96064a1242ac3a3359cad77c3042548405"
@@ -16,6 +19,9 @@ quantization = "Q4_K_M"
 [[models]]
 id = "qwen2.5-1.5b-instruct-q4-k-m"
 display_name = "Qwen2.5 1.5B Instruct Q4_K_M"
+description = "Balanced local model with better extraction quality for email knowledge graphs."
+download_size_bytes = 1120000000
+recommended = true
 format = "gguf"
 repository = "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
 revision = "91cad51170dc346986eccefdc2dd33a9da36ead9"
